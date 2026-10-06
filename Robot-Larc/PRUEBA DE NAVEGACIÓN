@@ -1,0 +1,225 @@
+/*
+ * =====================================================================
+ *   PRUEBA DE NAVEGACIÓN
+ *  Secuencia: Avanzar → Esquivar obstáculo → Línea de fondo → Homing lateral
+ * =====================================================================
+ */
+#include <Arduino.h>
+#include "Declaraciones.h"
+
+enum Estado {
+  ESPERAR_INICIO,
+  IR_A_CULTIVO,
+  ESQUIVAR_PISCINA_X,
+  HOMING_ESQUINA,
+  ESTADO_ERROR
+};
+
+const char* const NOMBRE_ESTADO[] = {
+  "ESPERAR_INICIO", "IR_A_CULTIVO", "ESQUIVAR_PISCINA_X", "HOMING_ESQUINA", "ESTADO_ERROR"
+};
+
+Estado   estadoActual   = ESPERAR_INICIO;
+bool     entrandoEstado = true;
+uint32_t tInicioEstado  = 0;
+
+// Parámetros de Esquiva
+int8_t   dirEsquiva        = DIRECCION_ESQUIVA_PREF;
+bool     esquivaDespejando = false;
+uint32_t tInicioDespejado  = 0;
+uint32_t tUltimaInversion  = 0;
+uint8_t  numEsquivas       = 0;
+
+// Resultados de la Prueba
+uint32_t tInicioPrueba   = 0;
+float    yAlLlegarLinea  = 0.0f;
+float    xInicioHoming   = 0.0f;
+bool     llegoPorTimeout = false;
+
+// =====================================================================
+// CONTROL DE ESTADOS
+// =====================================================================
+void cambiarEstado(int nuevo) {
+  pararMotores();
+  estadoActual   = (Estado)nuevo;
+  entrandoEstado = true;
+  tInicioEstado  = millis();
+#if DEBUG_SERIAL
+  Serial.printf(">>> Cambio de Estado: %s\n", NOMBRE_ESTADO[nuevo]);
+#endif
+}
+
+static inline bool alEntrar() {
+  if (entrandoEstado) { entrandoEstado = false; return true; }
+  return false;
+}
+
+static inline uint32_t tiempoEnEstado() { return millis() - tInicioEstado; }
+
+// =====================================================================
+// MÁQUINA DE ESTADOS FINITOS (FSM)
+// =====================================================================
+void estadoEsperarInicio() {
+  if (alEntrar()) pararMotores();
+
+  if (leerBotonStart()) {
+    odometriaReset();
+    numEsquivas     = 0;
+    llegoPorTimeout = false;
+    dirEsquiva      = DIRECCION_ESQUIVA_PREF;
+    tInicioPrueba   = millis();
+    cambiarEstado(IR_A_CULTIVO);
+  }
+}
+
+void estadoIrACultivo() {
+  alEntrar();
+
+  if (hayObstaculoFrontal(DIST_PISCINA_CM)) {
+    cambiarEstado(ESQUIVAR_PISCINA_X);
+    return;
+  }
+  if (irLinea(IR_FRENTE)) {                    // Línea del fondo detectada
+    yAlLlegarLinea = odometriaY();
+    cambiarEstado(HOMING_ESQUINA);
+    return;
+  }
+  if (tiempoEnEstado() > TIMEOUT_IR_A_CULTIVO) {
+    llegoPorTimeout = true;                    // Respaldo por timeout
+    yAlLlegarLinea  = odometriaY();
+    cambiarEstado(HOMING_ESQUINA);
+    return;
+  }
+  moverOmni(0, VEL_CRUCERO, 0);
+}
+
+void estadoEsquivarPiscina() {
+  const uint32_t ahora = millis();
+
+  if (alEntrar()) {
+    int8_t dir = elegirDireccionEsquiva();
+    dirEsquiva        = (dir != 0) ? dir : DIRECCION_ESQUIVA_PREF;
+    esquivaDespejando = false;
+    tUltimaInversion  = ahora;
+    numEsquivas++;
+  }
+
+  if (tiempoEnEstado() > TIMEOUT_ESQUIVA) { 
+    cambiarEstado(ESTADO_ERROR); 
+    return; 
+  }
+
+  // Inversión por límite de pista (líneas laterales)
+  if (ahora - tUltimaInversion > 600) {
+    if ((dirEsquiva > 0 && irLinea(IR_DER)) || (dirEsquiva < 0 && irLinea(IR_IZQ))) {
+      dirEsquiva = -dirEsquiva;
+      tUltimaInversion = ahora;
+      esquivaDespejando = false;
+    }
+  }
+
+  // Comprobación de frente despejado
+  if (!hayObstaculoFrontal(DIST_SEGURA_CM)) {
+    if (!esquivaDespejando) { 
+      esquivaDespejando = true; 
+      tInicioDespejado = ahora; 
+    }
+    else if (ahora - tInicioDespejado >= T_DESPEJADO_MS) {
+      cambiarEstado(IR_A_CULTIVO);
+      return;
+    }
+  } else {
+    esquivaDespejando = false;
+  }
+
+  moverOmni(dirEsquiva * VEL_ESQUIVA, 0, 0);
+}
+
+void estadoHomingEsquina() {
+  if (alEntrar()) {
+    xInicioHoming = odometriaX();
+  }
+
+  const bool lineaIzq = irLinea(IR_IZQ);
+  const bool timeout  = tiempoEnEstado() > TIMEOUT_HOMING;
+
+  if (lineaIzq || timeout) {
+    pararMotores();
+#if DEBUG_SERIAL
+    Serial.println("\n================ RESUMEN DE LA PRUEBA ================");
+    Serial.printf("Tiempo total .......... %.1f s\n", (millis() - tInicioPrueba) / 1000.0f);
+    Serial.printf("Esquivas realizadas ... %u\n", numEsquivas);
+    Serial.printf("Línea del fondo ....... %s (Avance Y = %.0f mm)\n",
+                  llegoPorTimeout ? "NO detectada (timeout)" : "detectada", yAlLlegarLinea);
+    Serial.printf("Línea izquierda ....... %s (Desplazamiento X = %.0f mm)\n",
+                  lineaIzq ? "detectada" : "NO detectada (timeout)", odometriaX() - xInicioHoming);
+    Serial.println("Pulsa START para repetir la prueba.");
+    Serial.println("======================================================\n");
+#endif
+    cambiarEstado(ESPERAR_INICIO);
+    return;
+  }
+  moverOmni(-VEL_HOMING, 0, 0);
+}
+
+void estadoError() {
+  if (alEntrar()) pararMotores();
+}
+
+// =====================================================================
+// DEPURACIÓN SERIE (2 Hz)
+// =====================================================================
+void depurar() {
+#if DEBUG_SERIAL
+  static uint32_t t = 0;
+  if (millis() - t < 500) return;
+  t = millis();
+  Serial.printf("[%s] US(i,c,d)=%d,%d,%d | IR(f,i,d)=%d%d%d | enc=%ld,%ld,%ld,%ld | odo X=%.0f Y=%.0f mm\n",
+                NOMBRE_ESTADO[estadoActual],
+                distUS(US_IZQ), distUS(US_CEN), distUS(US_DER),
+                irLinea(IR_FRENTE), irLinea(IR_IZQ), irLinea(IR_DER),
+                encPulsos(0), encPulsos(1), encPulsos(2), encPulsos(3),
+                odometriaX(), odometriaY());
+#endif
+}
+
+// =====================================================================
+// SETUP / LOOP
+// =====================================================================
+void setup() {
+  Serial.begin(115200);
+
+  const bool mcpListo = mcpIniciar();
+  iniciarMotores();
+  iniciarUltrasonidos();
+  iniciarInfrarrojos();
+  odometriaReset();
+
+  estadoActual   = mcpListo ? ESPERAR_INICIO : ESTADO_ERROR;
+  entrandoEstado = true;
+  tInicioEstado  = millis();
+
+#if DEBUG_SERIAL
+  if (mcpListo) Serial.println("Prueba de navegación lista. Pulsa START.");
+  else          Serial.println("ERROR: MCP23017 no detectado en 0x20. Revisa conexiones I2C.");
+#endif
+}
+
+void loop() {
+  actualizarMCP();
+  actualizarUltrasonidos();
+  actualizarIR();
+  actualizarOdometria();
+
+  if (!mcpOk() && estadoActual != ESTADO_ERROR) cambiarEstado(ESTADO_ERROR);
+
+  switch (estadoActual) {
+    case ESPERAR_INICIO:      estadoEsperarInicio();   break;
+    case IR_A_CULTIVO:        estadoIrACultivo();      break;
+    case ESQUIVAR_PISCINA_X:  estadoEsquivarPiscina(); break;
+    case HOMING_ESQUINA:      estadoHomingEsquina();   break;
+    case ESTADO_ERROR:        estadoError();           break;
+  }
+
+  depurar();
+}
