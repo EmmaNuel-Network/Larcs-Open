@@ -3,6 +3,18 @@
 // ==========================================
 #include <Arduino.h>
 
+// 3. ESTRUCTURA Y VARIABLES DEL CONTROL PD CON FEEDFORWARD
+struct ControlPD {
+  float Kp = 0.8f;         // Proporcional: Corrección según la desviación
+  float Kd = 0.02f;        // Derivativo: Amortiguación de cambios bruscos
+  float setpoint = 0.0f;   // Consigna PWM base (-255 a 255)
+  float errorPrev = 0.0f;  // Error del ciclo anterior
+  long pulsosAnteriores = 0;
+  int outputPWM = 0;
+};
+
+extern const int VELOCIDAD_CRUCERO;
+
 void setupMotores();
 void resetEncoders();
 void moverOmni(int Vx, int Vy, int W);
@@ -55,9 +67,12 @@ void setup() {
 
   setupMotores();
   pararMotores();
+  setupUltrasonidos();
+  setupInfrarrojos();
 }
 
 void loop() {
+  actualizarControlMotores();
   // A. PROCESAMIENTO ASÍNCRONO Y WATCHDOG DE VISIÓN
   procesarCamaraVision();
   if (millis() - ultimaLecturaCamara > WATCHDOG_CAMARA) {
@@ -221,8 +236,8 @@ void procesarCamaraVision() {
   }
 }
 
-__attribute__((weak)) int leerUltrasonidoFrontalBajo() { return 999; }
-__attribute__((weak)) int leerUltrasonidoAlto() { return 999; }
+//__attribute__((weak)) int leerUltrasonidoFrontalBajo() { return 999; }
+//__attribute__((weak)) int leerUltrasonidoAlto() { return 999; }
 __attribute__((weak)) bool leerSensorPisoFrente() { return false; }
 __attribute__((weak)) bool leerSensorPisoLateral() { return false; }
 __attribute__((weak)) void ejecutarMecanismoRecolector() { delay(100); }
