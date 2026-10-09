@@ -28,6 +28,7 @@ enum EstadoNavegacion {
   ESCANEAR_ARBOLES,
   ALINEAR_Y_RECOLECTAR,
   REGRESO_TOLVAS,
+  DESCARGAR_TOLVA,
   ESTADO_ERROR
 };
 
@@ -53,6 +54,8 @@ int mapearVelocidadVision(int error) {
   vel = constrain(vel, MIN_PWM_DEADBAND + 15, 110);
   return (error > 0) ? vel : -vel;
 }
+// Constante de tiempo límite para el viaje de regreso
+const unsigned long TIMEOUT_REGRESO = 8000; // 8 segundos máximo de reversa
 
 const unsigned long TIMEOUT_ESQUIVA = 6000;
 const unsigned long TIMEOUT_HOMING  = 7000;
@@ -297,11 +300,51 @@ void loop() {
       // Si no está centrada pero el error es muy bajo, se detiene levemente para no sobrepasar el blanco
       moverOmni(vx_ajuste, vy_ajuste, 0);
       break;
-      
-    case REGRESO_TOLVAS:
+
+case REGRESO_TOLVAS:
+      if (!estadoIniciado) {
+        tiempoInicioEstado = millis();
+        estadoIniciado = true;
+      }
+
+      // 1. Fallback por Timeout: Si en 8s no ve la línea, asume posición cercana y pasa a descargar
+      if (millis() - tiempoInicioEstado > TIMEOUT_REGRESO) {
+        pararMotores();
+        delay(100);
+        cambiarEstado(DESCARGAR_TOLVA);
+        break;
+      }
+
+      // 2. Detección de la línea negra de la zona de Beneficiadero
+      if (leerSensorPisoFrente() || leerSensorPisoLateral()) {
+        pararMotores();
+        delay(150); // Frenado e inercia cero
+        cambiarEstado(DESCARGAR_TOLVA);
+        break;
+      }
+
+      // 3. Desplazamiento suave en reversa hacia las tolvas
       moverOmni(0, -VELOCIDAD_CRUCERO, 0);
       break;
 
+    case DESCARGAR_TOLVA:
+      if (!estadoIniciado) {
+        tiempoInicioEstado = millis();
+        pararMotores(); // Asegura que el chasis esté completamente inmóvil
+        
+        // Acciona el servomotor de la compuerta trasera para liberar los granos
+        ejecutarDescargaTolva(); 
+        
+        estadoIniciado = true;
+      }
+
+      // Espera 3 segundos para asegurar la caída completa por gravedad de los frutos
+      if (millis() - tiempoInicioEstado > 3000) {
+        pararMotores();
+        // Misión finalizada con éxito: Pasa a reposo/espera
+        cambiarEstado(ESTADO_ERROR); // O un estado FIN_MISION / ESPERAR_INICIO
+      }
+      break;
     case ESTADO_ERROR:
       pararMotores();
       break;
