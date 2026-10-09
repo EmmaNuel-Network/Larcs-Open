@@ -35,6 +35,12 @@ EstadoNavegacion estadoActual = IR_A_CULTIVO;
 
 unsigned long tiempoInicioEstado = 0;
 bool estadoIniciado = false;
+bool lineaLateralPrevia = false;
+// Variables globales / estáticas necesarias para el escaneo
+unsigned long tiempoConfirmacionArbol = 0;
+const unsigned long TIEMPO_CONFIRMACION_ARBOL = 60; // 60 ms sostenidos sobre el tronco
+bool saliendoDeArbol = false;                        // Evita volver a enganchar el mismo árbol recién cosechado
+int contadorArboles = 0;
 
 const unsigned long TIMEOUT_ESQUIVA = 6000;
 const unsigned long TIMEOUT_HOMING  = 7000;
@@ -127,7 +133,7 @@ void loop() {
         break;
       }
       // Verificación de rango válido (descarta lecturas en 999 o 0)
-if ((distFrontalBaja > 35 && distFrontalBaja < 400) || distFrontalBaja == 999) {
+      if ((distFrontalBaja > 35 && distFrontalBaja < 400) || distFrontalBaja == 999) {
         if (tiempoLibreObstaculo == 0) {
           tiempoLibreObstaculo = millis();
         } else if (millis() - tiempoLibreObstaculo > 800) { // 800 ms sostenidos sin obstáculo
@@ -186,26 +192,61 @@ if ((distFrontalBaja > 35 && distFrontalBaja < 400) || distFrontalBaja == 999) {
       // 4. Traslación lateral a la izquierda con ajuste de retención en Y
       moverOmni(-VELOCIDAD_CRUCERO, velocidadY_correccion, 0);
       break;
-      
+
     case ESCANEAR_ARBOLES:
       if (!estadoIniciado) {
         tiempoInicioEstado = millis();
+        tiempoConfirmacionArbol = 0;
+        saliendoDeArbol = true; // Activa la bandera de despeje al iniciar o regresar de recolectar
         estadoIniciado = true;
       }
 
-      if (millis() - tiempoInicioEstado > TIMEOUT_SCAN) {
+      // 1. Interrupción por Fin de Campo (Límite lateral derecho alcanzado)
+      if (lineaPisoLateral) {
+        pararMotores();
         cambiarEstado(REGRESO_TOLVAS);
         break;
       }
 
-      if (distAlto > 0 && distAlto < 25) {
-        cambiarEstado(ALINEAR_Y_RECOLECTAR);
+      // 2. Fallback por Timeout de seguridad
+      if (millis() - tiempoInicioEstado > TIMEOUT_SCAN) {
+        pararMotores();
+        cambiarEstado(REGRESO_TOLVAS);
         break;
       }
 
-      moverOmni(120, 0, 0); 
-      break;
+      // 3. Mecanismo de Despeje: avanzar hasta alejarse del árbol recién cosechado
+      if (saliendoDeArbol) {
+        if (distAlto > 30 || distAlto == 999) {
+          saliendoDeArbol = false; // Ya superó el tronco anterior, habilita la búsqueda del siguiente
+        }
+      } else {
+        // 4. Búsqueda y filtrado del NUEVO árbol
+        if (distAlto > 0 && distAlto < 25) {
+          if (tiempoConfirmacionArbol == 0) {
+            tiempoConfirmacionArbol = millis();
+          } else if (millis() - tiempoConfirmacionArbol >= TIEMPO_CONFIRMACION_ARBOL) {
+            // Confirmado: Tronco detectado
+            pararMotores();
+            delay(50);
+            contadorArboles++;
+            cambiarEstado(ALINEAR_Y_RECOLECTAR);
+            break;
+          }
+        } else {
+          tiempoConfirmacionArbol = 0; // Reinicia si fue una lectura errática efímera
+        }
+      }
 
+      // 5. Corrección de Deriva en Y: Ajusta si el chasis se separa de la franja frontal
+      int velocidadY_correccion = 0;
+      if (!lineaPisoFrente) {
+        velocidadY_correccion = 40; // Mantiene el robot ceñido hacia el frente
+      }
+
+      // Avanza lateralmente hacia la derecha escaneando
+      moverOmni(120, velocidadY_correccion, 0);
+      break;
     case ALINEAR_Y_RECOLECTAR:
       if (!estadoIniciado) {
         tiempoInicioEstado = millis();
