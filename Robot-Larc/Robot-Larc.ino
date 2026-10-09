@@ -149,25 +149,44 @@ if ((distFrontalBaja > 35 && distFrontalBaja < 400) || distFrontalBaja == 999) {
     case HOMING_ESQUINA:
       if (!estadoIniciado) {
         tiempoInicioEstado = millis();
+        tiempoLineaLateralDetectada = 0;
         estadoIniciado = true;
       }
 
       // Fallback: Si no detecta línea en 7s, asume alineación por odometría/pared y continúa
       if (millis() - tiempoInicioEstado > TIMEOUT_HOMING) {
+        pararMotores();
         resetEncoders();
         cambiarEstado(ESCANEAR_ARBOLES);
         break;
       }
-
+// 2. Detección con filtro de estabilidad para lineaPisoLateral (Elimina ruido óptico)
       if (lineaPisoLateral) {
-        resetEncoders();
-        cambiarEstado(ESCANEAR_ARBOLES);
-        break;
+        if (tiempoLineaLateralDetectada == 0) {
+          tiempoLineaLateralDetectada = millis();
+        } else if (millis() - tiempoLineaLateralDetectada >= TIEMPO_CONFIRMACION_LINEA) {
+          // LLegó a la esquina real: frena, estabiliza chasis y resetea odometría
+          pararMotores();
+          delay(50); 
+          resetEncoders();
+          cambiarEstado(ESCANEAR_ARBOLES);
+          break;
+        }
+      } else {
+        tiempoLineaLateralDetectada = 0; // Reinicia el filtro si fue solo un destello efímero
       }
 
-      moverOmni(-VELOCIDAD_CRUCERO, 0, 0); 
-      break;
+      // 3. Corrección de Deriva en Y: Mantener la línea frontal mientras se mueve a la izquierda
+      int velocidadY_correccion = 0;
+      if (!lineaPisoFrente) {
+        // Si el robot empieza a derivar hacia atrás perdiendo la línea frontal, empuja levemente en Y
+        velocidadY_correccion = 45; 
+      }
 
+      // 4. Traslación lateral a la izquierda con ajuste de retención en Y
+      moverOmni(-VELOCIDAD_CRUCERO, velocidadY_correccion, 0);
+      break;
+      
     case ESCANEAR_ARBOLES:
       if (!estadoIniciado) {
         tiempoInicioEstado = millis();
