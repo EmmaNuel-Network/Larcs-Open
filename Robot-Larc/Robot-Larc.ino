@@ -41,6 +41,18 @@ unsigned long tiempoConfirmacionArbol = 0;
 const unsigned long TIEMPO_CONFIRMACION_ARBOL = 60; // 60 ms sostenidos sobre el tronco
 bool saliendoDeArbol = false;                        // Evita volver a enganchar el mismo árbol recién cosechado
 int contadorArboles = 0;
+// Variables y constantes para ALINEAR_Y_RECOLECTAR
+const unsigned long TIMEOUT_ALINEACION = 5000; // 5 segundos máximo para intentar centrar
+unsigned long tiempoCentradoConfirmado = 0;
+const unsigned long TIEMPO_CONFIRMACION_CENTRADO = 100; // Requiere 100 ms sostenidos de centrado
+
+// Función auxiliar para aplicar zona muerta en alineación por visión
+int mapearVelocidadVision(int error) {
+  if (abs(error) < 5) return 0; // Tolerancia de centrado (Deadband visual)
+  int vel = map(abs(error), 5, 120, MIN_PWM_DEADBAND + 15, 110);
+  vel = constrain(vel, MIN_PWM_DEADBAND + 15, 110);
+  return (error > 0) ? vel : -vel;
+}
 
 const unsigned long TIMEOUT_ESQUIVA = 6000;
 const unsigned long TIMEOUT_HOMING  = 7000;
@@ -250,19 +262,42 @@ void loop() {
     case ALINEAR_Y_RECOLECTAR:
       if (!estadoIniciado) {
         tiempoInicioEstado = millis();
+        tiempoCentradoConfirmado = 0;
         estadoIniciado = true;
       }
-
-      if (pelotaCentrada) {
+      // 1. Timeout de seguridad: Si en 5 segundos no logra centrar, aborta y sigue escaneando
+      if (millis() - tiempoInicioEstado > TIMEOUT_ALINEACION) {
         pararMotores();
-        ejecutarMecanismoRecolector();
         cambiarEstado(ESCANEAR_ARBOLES);
-      } else {
-        // Aplica escalado proporcional a la velocidad devuelta por visión
-        moverOmni(constrain(errorCamaraX, -100, 100), constrain(errorCamaraY, -100, 100), 0);
+        break;
       }
-      break;
+      // 2. Verificación de centrado sostenido (Filtro anti-vibración)
+      if (pelotaCentrada) {
+        if (tiempoCentradoConfirmado == 0) {
+          tiempoCentradoConfirmado = millis();
+        } else if (millis() - tiempoCentradoConfirmado >= TIEMPO_CONFIRMACION_CENTRADO) {
+          // Centrado confirmado: frena, deja estabilizar el chasis y recolecta
+          pararMotores();
+          delay(150); 
+          
+          ejecutarMecanismoRecolector(); // Acciona la rampa/servo/elevador
+          
+          delay(200); // Pausa post-cosecha
+          cambiarEstado(ESCANEAR_ARBOLES); // Vuelve al escaneo de la fila
+          break;
+        }
+      } else {
+        tiempoCentradoConfirmado = 0; // Reinicia si pierde el centrado momentáneamente
+      }
 
+      // 3. Control Proporcional Ajustado con Deadband
+      int vx_ajuste = mapearVelocidadVision(errorCamaraX);
+      int vy_ajuste = mapearVelocidadVision(errorCamaraY);
+
+      // Si no está centrada pero el error es muy bajo, se detiene levemente para no sobrepasar el blanco
+      moverOmni(vx_ajuste, vy_ajuste, 0);
+      break;
+      
     case REGRESO_TOLVAS:
       moverOmni(0, -VELOCIDAD_CRUCERO, 0);
       break;
