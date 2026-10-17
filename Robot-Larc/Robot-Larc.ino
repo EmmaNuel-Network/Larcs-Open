@@ -71,11 +71,35 @@ int leerUltrasonidoFrontalBajo();
 int leerUltrasonidoAlto();
 
 // 4. CAMBIO DE ESTADO
+// CÓDIGO CON INTEGRACIÓN DE VISIÓN:
 void cambiarEstado(EstadoFSM nuevoEstado) {
   pararMotores();
   estadoActual = nuevoEstado;
   estadoIniciado = false;
   tiempoInicioEstado = millis();
+
+  // =========================================================
+  // NOTIFICACIÓN DE MODO DE VISIÓN A LA RASPBERRY PI
+  // =========================================================
+  switch (nuevoEstado) {
+    case IR_A_CULTIVO:
+    case ESQUIVAR_PISCINA:
+      Serial2.println("PISCINAS");
+      break;
+
+    case RECOLECCION_MULTINIVEL:
+    case ALINEAR_Y_CAPTURAR:
+      Serial2.println("PELOTAS");
+      break;
+
+    case REGRESO_BENEFICIADERO:
+    case DESCARGA_PAYLOAD:
+      Serial2.println("CONTENEDORES");
+      break;
+
+    default:
+      break;
+  }
 }
 
 // 5. FUNCIONES DE ACTUACIÓN SECUNDARIAS

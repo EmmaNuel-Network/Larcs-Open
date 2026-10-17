@@ -1,7 +1,7 @@
 import cv2
 import requests
 
-IP_ESP32 = "192.168.8.125"
+IP_ESP32 = "192.168.1.12"
 url = f"http://{IP_ESP32}:81/stream"
 requests.get(f"http://{IP_ESP32}/control?var=led_intensity&val=255")
 cap = cv2.VideoCapture(url)
