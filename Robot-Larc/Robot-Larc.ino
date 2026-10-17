@@ -3,6 +3,19 @@
 // ==========================================
 #include <Arduino.h>
 #include <ESP32Servo.h>
+#include <Wire.h>
+#include <Adafruit_MCP23X17.h>
+
+Adafruit_MCP23X17 mcp;
+
+struct ControlPD {
+  float setpoint = 0.0f;
+  long pulsosAnteriores = 0;
+  float errorPrev = 0.0f;
+  float Kp = 1.2f;  // Ganancia Proporcional base
+  float Kd = 0.15f; // Ganancia Derivativa base
+  int outputPWM = 0;
+};
 
 // 1. ESTADOS DE LA FSM PRINCIPAL (TDP Octavio I)
 enum EstadoFSM {
@@ -21,13 +34,13 @@ enum EstadoFSM {
 EstadoFSM estadoActual = ESPERA_INICIO;
 
 // 2. PINES Y ACTUADORES ADICIONALES
-const int pinBotonStart      = 15; // Botón de inicio de competencia
-const int pinServoCompuerta  = 18; // Servo de descarga trasera
+const int pinBotonStart      = 13; // Botón de inicio de competencia
+const int pinServoCompuerta  = 25; // Servo de descarga trasera
 Servo servoCompuerta;
 
 // Control del Elevador NEMA-17 (Rack & Pinion)
-const int pinStepElevador    = 22;
-const int pinDirElevador     = 23;
+const int pinStepElevador    = 14;
+const int pinDirElevador     = 15;
 int nivelActualH             = 1;  // Niveles: 1 (H1), 2 (H2), 3 (H3)
 
 // 3. VARIABLES DE CONTROL DE TIEMPO Y NAVEGACIÓN
@@ -83,13 +96,13 @@ void moverElevadorANivel(int nivel) {
   pararMotores(); // Detiene inercia de tracción antes de energizar paso a paso
   if (nivel == nivelActualH) return;
 
-  digitalWrite(pinDirElevador, (nivel > nivelActualH) ? HIGH : LOW);
+  mcp.digitalWrite(pinDirElevador, (nivel > nivelActualH) ? HIGH : LOW);
   int pasos = abs(nivel - nivelActualH) * 400; // Pasos según relación mecánica
 
   for (int i = 0; i < pasos; i++) {
-    digitalWrite(pinStepElevador, HIGH);
-    delayMicroseconds(800); // 800us para asegurar torque con carga
-    digitalWrite(pinStepElevador, LOW);
+    mcp.digitalWrite(pinStepElevador, HIGH);
+    delayMicroseconds(800); 
+    mcp.digitalWrite(pinStepElevador, LOW);
     delayMicroseconds(800);
   }
   nivelActualH = nivel;
@@ -143,15 +156,23 @@ void procesarCamaraVision() {
 
 // 7. SETUP
 void setup() {
+  
   Serial.begin(115200);   
-  Serial2.begin(115200, SERIAL_8N1, 16, 17); // Comunicación UART2 con ESP32-CAM
+  Serial2.begin(115200, SERIAL_8N1, 16, 26);
 
-  pinMode(pinBotonStart, INPUT_PULLUP);
-  pinMode(pinStepElevador, OUTPUT);
-  pinMode(pinDirElevador, OUTPUT);
+  // NUEVO: Inicialización del I2C y MCP23017
+  Wire.begin(21, 22); // SDA = 21, SCL = 22
+  if (!mcp.begin_I2C()) {
+    Serial.println("Error al iniciar el MCP23017. Revisa conexiones.");
+    while (1); // Detiene el código si no encuentra el MCP
+  }
+
+  mcp.pinMode(pinBotonStart, INPUT_PULLUP);
+  mcp.pinMode(pinStepElevador, OUTPUT);
+  mcp.pinMode(pinDirElevador, OUTPUT);
 
   servoCompuerta.attach(pinServoCompuerta);
-  servoCompuerta.write(0); // Compuerta cerrada por defecto
+  servoCompuerta.write(0);
 
   setupMotores();
   pararMotores();
@@ -182,7 +203,7 @@ void loop() {
   switch (estadoActual) {
 
     case ESPERA_INICIO:
-      if (digitalRead(pinBotonStart) == LOW) { // Botón presionado (PULLUP)
+      if (mcp.digitalRead(pinBotonStart) == LOW) { // <-- Se lee desde el MCP
         cambiarEstado(IR_A_CULTIVO);
       }
       break;
