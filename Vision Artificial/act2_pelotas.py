@@ -17,7 +17,7 @@ azul_upper = np.array([125, 176, 200])
 amarillo_lower = np.array([10, 35, 134])
 amarillo_upper = np.array([33, 108, 270])
 
-rojo_lower_1 = np.array([167, 90, 55])
+rojo_lower_1 = np.array([167, 90, 55]) 
 rojo_upper_1 = np.array([179, 194, 200])
 naranja_lower = np.array([171, 96, 70])
 naranja_upper = np.array([179, 255, 255])
