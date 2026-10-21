@@ -1,14 +1,14 @@
-// ============================================================================
-// ORQUESTADOR DE PRUEBA: 6 MOVIMIENTOS HOLONÓMICOS
-// ============================================================================
-
+// ==========================================
+// PRUEBA DE ESQUIVA DE PISCINAS CON PD
+// ==========================================
 #include <Arduino.h>
 #include <Wire.h>
 #include <Adafruit_MCP23X17.h>
 
+
 Adafruit_MCP23X17 mcp;
 
-// Declaración del struct para evitar el error de ámbito de compilación
+// Definición local de struct ControlPD si no usas la cabecera global
 struct ControlPD {
   float setpoint = 0.0f;
   long pulsosAnteriores = 0;
@@ -18,90 +18,106 @@ struct ControlPD {
   int outputPWM = 0;
 };
 
-// Declaración de funciones de Motores.ino
+// Declaración de funciones externas de tus módulos
 void setupMotores();
 void actualizarControlMotores();
 void moverOmni(int Vx, int Vy, int W);
 void pararMotores();
 
-// Variables temporales de la secuencia
-unsigned long ultimoCambioEtapa = 0;
-int etapaActual = -1; 
-const unsigned long TIEMPO_MOVIMIENTO = 2500; // 2.5 segundos de movimiento
-const unsigned long TIEMPO_PAUSA      = 1000; // 1.0 segundo de pausa
+void setupUltrasonidos();
+int leerUltrasonidoFrontalBajo();
+int leerUltrasonidoLateral();
+int obtenerCorreccionParedPD(int distMedida);
 
-bool enPausa = true;
+// Estados de la máquina reducida
+enum EstadoPrueba {
+  AVANZAR_AL_FRENTE,
+  ESQUIVAR_DERECHA,
+  VERIFICAR_LIBERACION
+};
+
+EstadoPrueba estadoPrueba = AVANZAR_AL_FRENTE;
+unsigned long tiempoInicioEstado = 0;
+unsigned long tiempoDespejado = 0;
+
+const int VELOCIDAD_BASE = 120; // Velocidad moderada y precisa
 
 void setup() {
-  Serial.begin(115200);
 
-  Wire.begin(21, 22);
+  Serial.begin(115200);
+  
+  Wire.begin(21, 22); // SDA = 21, SCL = 22
   if (!mcp.begin_I2C()) {
-    Serial.println("¡Error al conectar con el MCP23017!");
+    Serial.println("Error al iniciar MCP23017");
     while (1);
   }
 
+  
   setupMotores();
+  setupUltrasonidos();
   pararMotores();
 
-  Serial.println("--- ESTABILIZANDO PROCESADOR (3 SEGUNDOS) ---");
-  delay(3000); // Pausa de arranque seguro
-
-  Serial.println("--- INICIANDO SECUENCIA DE 6 MOVIMIENTOS OMNI ---");
-  ultimoCambioEtapa = millis();
+  delay(2000); // Pausa de seguridad antes de arrancar
+  Serial.println("--- Inicio de Prueba de Esquiva de Piscinas ---");
 }
 
 void loop() {
-  // 1. Ejecución continua del control PD a 50Hz (Motores.ino)
+  // 1. Mantiene corriendo el control PD de motores a alta frecuencia
   actualizarControlMotores();
 
-  // 2. Máquina de tiempo para iterar los 6 movimientos
-  unsigned long tiempoActual = millis();
+  // 2. Lecturas continuas de sensores
+  int distFrontal = leerUltrasonidoFrontalBajo();
+  int distLateral = leerUltrasonidoLateral();
 
-  if (enPausa) {
-    if (tiempoActual - ultimoCambioEtapa >= TIEMPO_PAUSA) {
-      enPausa = false;
-      etapaActual = (etapaActual + 1) % 6;
-      ultimoCambioEtapa = tiempoActual;
+  // 3. Máquina de estados reducida
+  switch (estadoPrueba) {
 
-      switch (etapaActual) {
-        case 0:
-          Serial.println("\n1. AVANZAR (+Vy): Todas las ruedas hacia adelante");
-          moverOmni(0, 150, 0);
-          break;
+    case AVANZAR_AL_FRENTE:
+      // Avance longitudinal constante
+      moverOmni(0, VELOCIDAD_BASE, 0);
 
-        case 1:
-          Serial.println("\n2. RETROCEDER (-Vy): Todas las ruedas hacia atrás");
-          moverOmni(0, -150, 0);
-          break;
-
-        case 2:
-          Serial.println("\n3. TRASLACIÓN DERECHA (+Vx): Traslación lateral limpia");
-          moverOmni(150, 0, 0);
-          break;
-
-        case 3:
-          Serial.println("\n4. TRASLACIÓN IZQUIERDA (-Vx): Traslación lateral limpia");
-          moverOmni(-150, 0, 0);
-          break;
-
-        case 4:
-          Serial.println("\n5. ROTACIÓN CLOCKWISE (+W): Giro horario sobre su eje");
-          moverOmni(0, 0, 100);
-          break;
-
-        case 5:
-          Serial.println("\n6. ROTACIÓN COUNTER-CLOCKWISE (-W): Giro antihorario");
-          moverOmni(0, 0, -100);
-          break;
+      // Si detecta piscina o pared enfrente (< 20 cm)
+      if (distFrontal > 0 && distFrontal < 20) {
+        pararMotores();
+        tiempoInicioEstado = millis();
+        estadoPrueba = ESQUIVAR_DERECHA;
+        Serial.println("-> Obstáculo detectado. Iniciando esquiva a la derecha...");
       }
+      break;
+
+    case ESQUIVAR_DERECHA: {
+      // Ajuste PD usando la distancia del sensor lateral a la piscina
+      int correccionPD = obtenerCorreccionParedPD(distLateral);
+
+      // Se desplaza a la derecha (+Vx) mientras corrige el avance/retroceso (+/- Vy) con el PD
+      moverOmni(VELOCIDAD_BASE, correccionPD, 0);
+
+      // Si el sensor frontal ya ve libre (> 35 cm)
+      if (distFrontal > 35 && distFrontal < 300) {
+        tiempoDespejado = millis();
+        estadoPrueba = VERIFICAR_LIBERACION;
+        Serial.println("-> Frente despejado. Verificando liberación...");
+      }
+      break;
     }
-  } else {
-    if (tiempoActual - ultimoCambioEtapa >= TIEMPO_MOVIMIENTO) {
-      pararMotores();
-      enPausa = true;
-      ultimoCambioEtapa = tiempoActual;
-      Serial.println("-> [PAUSA]");
+
+    case VERIFICAR_LIBERACION: {
+      int correccionPD = obtenerCorreccionParedPD(distLateral);
+      moverOmni(VELOCIDAD_BASE, correccionPD, 0);
+
+      // Si el obstáculo vuelve a aparecer enfrente, regresa al estado de esquiva
+      if (distFrontal > 0 && distFrontal <= 35) {
+        estadoPrueba = ESQUIVAR_DERECHA;
+        break;
+      }
+
+      // Sostiene la esquiva lateral durante 800 ms para rebasar la esquina del obstáculo
+      if (millis() - tiempoDespejado > 800) {
+        pararMotores();
+        estadoPrueba = AVANZAR_AL_FRENTE;
+        Serial.println("-> Obstáculo superado por completo. Reanudando avance al frente...");
+      }
+      break;
     }
   }
 }

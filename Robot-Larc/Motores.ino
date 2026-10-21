@@ -226,7 +226,7 @@ void pararMotores() {
   pdM4.setpoint = 0; pdM4.errorPrev = 0;
 
   setDriverMotor(pinM1_IN1, pinM1_IN2, pinM1_PWM, 0);
-  setDriverMotor(pinM2_IN1, pinM2_IN2, pinM2_PWM, 0);
+  setDriverMotor(pinM2_IN1, pinM2_IN2, -pinM2_PWM, 0);
   setDriverMotor(pinM3_IN1, pinM3_IN2, pinM3_PWM, 0);
-  setDriverMotor(pinM4_IN1, pinM4_IN2, pinM4_PWM, 0);
+  setDriverMotor(pinM4_IN1, pinM4_IN2, -pinM4_PWM, 0);
 }
