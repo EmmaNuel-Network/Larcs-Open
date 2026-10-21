@@ -191,9 +191,9 @@ void actualizarControlMotores() {
     pdM4.outputPWM = calcularPDMotor(pdM4, getPulsosM4(), dt);
 
     setDriverMotor(pinM1_IN1, pinM1_IN2, pinM1_PWM, pdM1.outputPWM);
-    setDriverMotor(pinM2_IN1, pinM2_IN2, pinM2_PWM, pdM2.outputPWM);//Se invierte el sentido de polaridad para no tocar cables
+    setDriverMotor(pinM2_IN1, pinM2_IN2, pinM2_PWM, -pdM2.outputPWM);
     setDriverMotor(pinM3_IN1, pinM3_IN2, pinM3_PWM, pdM3.outputPWM);
-    setDriverMotor(pinM4_IN1, pinM4_IN2, pinM4_PWM, pdM4.outputPWM);
+    setDriverMotor(pinM4_IN1, pinM4_IN2, pinM4_PWM, -pdM4.outputPWM);
   }
 }
 
