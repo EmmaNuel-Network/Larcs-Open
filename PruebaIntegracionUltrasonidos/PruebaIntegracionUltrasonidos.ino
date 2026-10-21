@@ -25,7 +25,8 @@ void moverOmni(int Vx, int Vy, int W);
 void pararMotores();
 
 void setupUltrasonidos();
-int leerUltrasonidoFrontalBajo();
+void actualizarLecturasUltrasonido();
+int leerUltrasonidoAlto();
 int leerUltrasonidoLateral();
 int obtenerCorreccionParedPD(int distMedida);
 
@@ -64,9 +65,10 @@ void setup() {
 void loop() {
   // 1. Mantiene corriendo el control PD de motores a alta frecuencia
   actualizarControlMotores();
+  actualizarLecturasUltrasonido();
 
   // 2. Lecturas continuas de sensores
-  int distFrontal = leerUltrasonidoFrontalBajo();
+  int distFrontal = leerUltrasonidoAlto();
   int distLateral = leerUltrasonidoLateral();
 
   // 3. Máquina de estados reducida

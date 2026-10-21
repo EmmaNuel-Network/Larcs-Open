@@ -51,7 +51,7 @@ int medirSensorDirecto(int pinTrig, int pinEcho) {
   digitalWrite(pinTrig, LOW);
 
   // Timeout de 4500 us (~80 cm max). Previene congelamientos si no hay eco
-  long duracion = pulseIn(pinEcho, HIGH, 4500); 
+  long duracion = pulseIn(pinEcho, HIGH, 15000); 
 
   if (duracion == 0) {
     return 999; // Fuera de rango
