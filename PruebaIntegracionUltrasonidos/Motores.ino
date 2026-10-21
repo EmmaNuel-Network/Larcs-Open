@@ -8,30 +8,29 @@ extern Adafruit_MCP23X17 mcp;
 // Declaración única de las instancias globales
 ControlPD pdM1, pdM2, pdM3, pdM4;
 
-// 2. ASIGNACIÓN DE PINES EN ESP32
-const int pinM1_IN1 = 0; // PA0
-const int pinM1_IN2 = 1; // PA1
-const int pinM1_PWM = 12; // ENA Módulo 1
-const int pinEncM1A = 34; // GPI: Requiere Pull-Up física
-const int pinEncM1B = 2; // GPI: Requiere Pull-Up física
+// ==========================================
+// ASIGNACIÓN DE PINES CORREGIDA EN Motores.ino
+// ==========================================
+const int pinM1_IN1 = 0;  // PA0
+const int pinM1_IN2 = 1;  // PA1
+const int pinM1_PWM = 12; // ENA (GPIO 12)
 
-const int pinM2_IN1 = 2; // PA2
-const int pinM2_IN2 = 3; // PA3
-const int pinM2_PWM = 13; // ENB Módulo 1
-const int pinEncM2A = 35; // GPI: Requiere Pull-Up física
-const int pinEncM2B = 5; // GPI: Requiere Pull-Up física
+const int pinM3_IN1 = 2;  // PA2 (IN3 en Driver Izq)
+const int pinM3_IN2 = 3;  // PA3 (IN4 en Driver Izq)
+const int pinM3_PWM = 13; // ENB (GPIO 13)
 
-const int pinM3_IN1 = 4; // PA4
-const int pinM3_IN2 = 5; // PA5
-const int pinM3_PWM = 14; // ENA Módulo 2
-const int pinEncM3A = 4;
-const int pinEncM3B = 15;
+const int pinM2_IN1 = 4;  // PA4 (IN1 en Driver Der)
+const int pinM2_IN2 = 5;  // PA5 (IN2 en Driver Der)
+const int pinM2_PWM = 14; // ENA (GPIO 14)
 
-const int pinM4_IN1 = 6; // PA6
-const int pinM4_IN2 = 7; // PA7
-const int pinM4_PWM = 27; // ENB Módulo 2
-const int pinEncM4A = 17;
-const int pinEncM4B = 33;
+const int pinM4_IN1 = 6;  // PA6 (IN3 en Driver Der)
+const int pinM4_IN2 = 7;  // PA7 (IN4 en Driver Der)
+const int pinM4_PWM = 27; // ENB (GPIO 27)
+
+const int pinEncM1A = 34; const int pinEncM1B = 2;   // Delantero Izq
+const int pinEncM2A = 35; const int pinEncM2B = 5;   // Delantero Der
+const int pinEncM3A = 4;  const int pinEncM3B = 15;  // Trasero Izq
+const int pinEncM4A = 17; const int pinEncM4B = 33;  // Trasero Der
 
 // 3. VARIABLES GLOBALES Y SECCIÓN CRÍTICA
 volatile long pulsosM1 = 0;
@@ -109,7 +108,7 @@ void setupMotores() {
   mcp.pinMode(pinM3_IN1, OUTPUT); mcp.pinMode(pinM3_IN2, OUTPUT);
   mcp.pinMode(pinM4_IN1, OUTPUT); mcp.pinMode(pinM4_IN2, OUTPUT);
 
-pinMode(pinM1_PWM, OUTPUT);
+  pinMode(pinM1_PWM, OUTPUT);
   pinMode(pinM2_PWM, OUTPUT);
   pinMode(pinM3_PWM, OUTPUT);
   pinMode(pinM4_PWM, OUTPUT);
@@ -192,7 +191,7 @@ void actualizarControlMotores() {
     pdM4.outputPWM = calcularPDMotor(pdM4, getPulsosM4(), dt);
 
     setDriverMotor(pinM1_IN1, pinM1_IN2, pinM1_PWM, pdM1.outputPWM);
-    setDriverMotor(pinM2_IN1, pinM2_IN2, pinM2_PWM, pdM2.outputPWM);
+    setDriverMotor(pinM2_IN1, pinM2_IN2, pinM2_PWM, pdM2.outputPWM);//Se invierte el sentido de polaridad para no tocar cables
     setDriverMotor(pinM3_IN1, pinM3_IN2, pinM3_PWM, pdM3.outputPWM);
     setDriverMotor(pinM4_IN1, pinM4_IN2, pinM4_PWM, pdM4.outputPWM);
   }
