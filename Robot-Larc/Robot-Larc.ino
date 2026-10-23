@@ -54,6 +54,10 @@ unsigned long ultimaLecturaCamara   = 0;
 char bufferUART[64];
 size_t idxBuffer = 0;
 
+//Constantes de Control Proporcional para centrado
+const float KP_CENTRADO = 0.65;
+const int VELOCIDAD_MAX_CENTRADO = 90; //Límite de velocidad en PWM
+
 // Declaración de funciones externas (Motores, Infrarrojos, Ultrasonidos)
 void setupMotores();
 void actualizarControlMotores();
@@ -85,6 +89,10 @@ void cambiarEstado(EstadoFSM nuevoEstado) {
     case IR_A_CULTIVO:
     case ESQUIVAR_PISCINA:
       Serial2.println("PISCINAS");
+      break;
+    
+    case HOMING_Y_ESCUADRADO:
+      Serial2.println("ARBOLES");
       break;
 
     case RECOLECCION_MULTINIVEL:
@@ -339,10 +347,12 @@ void loop() {
         ejecutarMecanismoRecolector();
         cambiarEstado(RECOLECCION_MULTINIVEL);
       } else {
-        // Corrección holonómica con Zona Muerta (Deadband = 10 px)
-        int vx = (abs(errorCamaraX) > 10) ? constrain(errorCamaraX, -80, 80) : 0;
-        int vy = (abs(errorCamaraY) > 10) ? constrain(errorCamaraY, -80, 80) : 0;
-        moverOmni(vx, vy, 0);
+        // Control proporcional con desviación
+        int vx= 0;
+        if(abs(errorCamaraX) >12){//Zona muerta de 12 px
+          vx= constrain((int)(errorCamaraX * KP_CENTRADO), -VELOCIDAD_MAX_CENTRADO, VELOCIDAD_MAX_CENTRADO);
+        }
+        moverOmni(vx, 0, 0);
       }
       break;
 
