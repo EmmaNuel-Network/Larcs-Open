@@ -44,6 +44,7 @@ enum EstadoFSM {
 // Si la FSM intenta entrar a un estado no permitido, el robot se detiene
 // (FIN_MISION) y lo reporta por Serial.
 enum ModoPrueba {
+  PRUEBA_SENSORES,      // Robot quieto: imprime IR y ultrasonidos cada 200 ms
   PRUEBA_ESQUIVA,       // Idéntico a PruebaIntegracionUltrasonidos (sin IR)
   PRUEBA_IR_A_CULTIVO,  // Esquiva + se detiene al ver la línea del cultivo
   PRUEBA_HOMING,        // Arranca en homing (poner el robot sobre la línea)
@@ -119,6 +120,8 @@ void setupUltrasonidos();
 void actualizarLecturasUltrasonido();
 int leerUltrasonidoAlto();
 int leerUltrasonidoLateral();
+int leerUltrasonidoFrontalBajo();
+float calcularErrorLinea();
 int obtenerCorreccionParedPD(int distMedida);
 
 // ==========================================
@@ -143,6 +146,7 @@ const char* nombreEstado(EstadoFSM e) {
 
 EstadoFSM estadoInicial() {
   switch (MODO) {
+    case PRUEBA_SENSORES:     return FIN_MISION; // No se mueve
     case PRUEBA_ESQUIVA:
     case PRUEBA_IR_A_CULTIVO: return IR_A_CULTIVO;
     case PRUEBA_HOMING:       return HOMING_Y_ESCUADRADO;
@@ -157,6 +161,8 @@ bool estadoPermitido(EstadoFSM e) {
   if (e == FIN_MISION || e == ESTADO_ERROR) return true;
 
   switch (MODO) {
+    case PRUEBA_SENSORES:
+      return false;
     case PRUEBA_ESQUIVA:
     case PRUEBA_IR_A_CULTIVO:
       return (e == IR_A_CULTIVO || e == ESQUIVAR_PISCINA || e == VERIFICAR_LIBERACION);
@@ -258,6 +264,39 @@ void procesarCamaraVision() {
 }
 
 // ==========================================
+// 9b. DIAGNÓSTICO DE SENSORES (solo PRUEBA_SENSORES)
+// ==========================================
+// Lee el puerto B del MCP completo en una sola transacción I2C.
+// Mapeo según Infrarojos.ino:
+//   PB0 = frontal centro, PB1 = frontal izq, PB2 = frontal der,
+//   PB3 = lateral izq,    PB4 = lateral der
+// Se espera: 1 = negro, 0 = blanco.
+const unsigned long INTERVALO_DIAGNOSTICO_MS = 200;
+unsigned long ultimoDiagnostico = 0;
+
+void imprimirDiagnosticoSensores(int distFrontal, int distLateral) {
+  if (millis() - ultimoDiagnostico < INTERVALO_DIAGNOSTICO_MS) return;
+  ultimoDiagnostico = millis();
+
+  uint8_t puertoB = mcp.readGPIOB();
+  int fCen = (puertoB >> 0) & 1;
+  int fIzq = (puertoB >> 1) & 1;
+  int fDer = (puertoB >> 2) & 1;
+  int lIzq = (puertoB >> 3) & 1;
+  int lDer = (puertoB >> 4) & 1;
+
+  float posLinea = calcularErrorLinea(); // -1 izq, 0 centro, +1 der, 999 sin línea
+  int distBajo = leerUltrasonidoFrontalBajo();
+
+  Serial.printf("IR frontal [izq cen der] = %d %d %d  pos=", fIzq, fCen, fDer);
+  if (posLinea >= 999.0f) Serial.print(" ---");
+  else                    Serial.printf("%+.2f", posLinea);
+  Serial.printf("  | lateral izq=%d der=%d", lIzq, lDer);
+  Serial.printf("  | US frontal(23)=%3d lateral(32)=%3d bajo(19)=%3d\n",
+                distFrontal, distLateral, distBajo);
+}
+
+// ==========================================
 // 10. SETUP
 // ==========================================
 void setup() {
@@ -292,6 +331,10 @@ void setup() {
     mcp.pinMode(pinBotonStart, INPUT_PULLUP);
     estadoActual = ESPERA_INICIO;
     Serial.println("--- COMPETENCIA: esperando botón de inicio ---");
+  } else if (MODO == PRUEBA_SENSORES) {
+    estadoActual = FIN_MISION;
+    Serial.println("--- MODO SENSORES: robot quieto, diagnóstico cada 200 ms ---");
+    Serial.println("Esperado: 1 = negro, 0 = blanco. Ultrasonidos en cm (999 = sin eco).");
   } else {
     delay(2000); // Pausa de seguridad (igual que la prueba)
     estadoActual = estadoInicial();
@@ -332,6 +375,12 @@ void loop() {
     margenDer    = detectoMargenDerecho();
   }
   bool lineaArmada = (millis() - tiempoInicioMision > VENTANA_IGNORAR_LINEA_MS);
+
+  // Modo diagnóstico: solo imprime, la FSM no corre y los motores siguen en 0
+  if (MODO == PRUEBA_SENSORES) {
+    imprimirDiagnosticoSensores(distFrontal, distLateral);
+    return;
+  }
 
   // ==========================================
   // MÁQUINA DE ESTADOS
