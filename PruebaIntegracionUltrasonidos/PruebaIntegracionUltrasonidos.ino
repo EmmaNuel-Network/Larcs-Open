@@ -1,14 +1,13 @@
 // ==========================================
-// PRUEBA DE ESQUIVA DE PISCINAS CON PD
+// PRUEBA DE ESQUIVA DE PISCINAS CON PD (Corregido)
 // ==========================================
 #include <Arduino.h>
 #include <Wire.h>
 #include <Adafruit_MCP23X17.h>
 
-
 Adafruit_MCP23X17 mcp;
 
-// Definición local de struct ControlPD si no usas la cabecera global
+// Definición local de struct ControlPD
 struct ControlPD {
   float setpoint = 0.0f;
   long pulsosAnteriores = 0;
@@ -44,7 +43,6 @@ unsigned long tiempoDespejado = 0;
 const int VELOCIDAD_BASE = 120; // Velocidad moderada y precisa
 
 void setup() {
-
   Serial.begin(115200);
   
   Wire.begin(21, 22); // SDA = 21, SCL = 22
@@ -53,7 +51,6 @@ void setup() {
     while (1);
   }
 
-  
   setupMotores();
   setupUltrasonidos();
   pararMotores();
@@ -63,38 +60,45 @@ void setup() {
 }
 
 void loop() {
-  // 1. Mantiene corriendo el control PD de motores a alta frecuencia
   actualizarControlMotores();
   actualizarLecturasUltrasonido();
 
-  // 2. Lecturas continuas de sensores
   int distFrontal = leerUltrasonidoAlto();
   int distLateral = leerUltrasonidoLateral();
 
-  // 3. Máquina de estados reducida
+  // UNIFICACIÓN: Toma la menor distancia válida entre ambos sensores
+  // Si ambos ven pared, usará la más cercana. Si solo uno la ve, usará esa.
+  int distParedEfectiva = 999;
+  if (distFrontal < 999 && distLateral < 999) {
+    distParedEfectiva = min(distFrontal, distLateral);
+  } else if (distFrontal < 999) {
+    distParedEfectiva = distFrontal;
+  } else if (distLateral < 999) {
+    distParedEfectiva = distLateral;
+  }
+
   switch (estadoPrueba) {
 
     case AVANZAR_AL_FRENTE:
-      // Avance longitudinal constante
       moverOmni(0, VELOCIDAD_BASE, 0);
 
-      // Si detecta piscina o pared enfrente (< 20 cm)
-      if (distFrontal > 0 && distFrontal < 20) {
+      // Si cualquiera de los dos detecta obstáculo al frente/cerca
+      if (distFrontal >= 3 && distFrontal < 20) {
         pararMotores();
         tiempoInicioEstado = millis();
         estadoPrueba = ESQUIVAR_DERECHA;
-        Serial.println("-> Obstáculo detectado. Iniciando esquiva a la derecha...");
+        Serial.println("-> Obstáculo detectado. Iniciando esquiva...");
       }
       break;
 
     case ESQUIVAR_DERECHA: {
-      // Ajuste PD usando la distancia del sensor lateral a la piscina
-      int correccionPD = obtenerCorreccionParedPD(distLateral);
+      // Usa la distancia unificada (sea del frontal, lateral o ambos)
+      int correccionPD = obtenerCorreccionParedPD(distParedEfectiva);
 
-      // Se desplaza a la derecha (+Vx) mientras corrige el avance/retroceso (+/- Vy) con el PD
+      // Desplazamiento lateral con corrección homogénea
       moverOmni(VELOCIDAD_BASE, correccionPD, 0);
 
-      // Si el sensor frontal ya ve libre (> 35 cm)
+      // Salida del estado solo si AMBOS sensores ven libre el frente
       if (distFrontal > 35 && distFrontal < 300) {
         tiempoDespejado = millis();
         estadoPrueba = VERIFICAR_LIBERACION;
@@ -104,20 +108,18 @@ void loop() {
     }
 
     case VERIFICAR_LIBERACION: {
-      int correccionPD = obtenerCorreccionParedPD(distLateral);
+      int correccionPD = obtenerCorreccionParedPD(distParedEfectiva);
       moverOmni(VELOCIDAD_BASE, correccionPD, 0);
 
-      // Si el obstáculo vuelve a aparecer enfrente, regresa al estado de esquiva
-      if (distFrontal > 0 && distFrontal <= 35) {
+      if (distFrontal >= 3 && distFrontal <= 35) {
         estadoPrueba = ESQUIVAR_DERECHA;
         break;
       }
 
-      // Sostiene la esquiva lateral durante 800 ms para rebasar la esquina del obstáculo
       if (millis() - tiempoDespejado > 800) {
         pararMotores();
         estadoPrueba = AVANZAR_AL_FRENTE;
-        Serial.println("-> Obstáculo superado por completo. Reanudando avance al frente...");
+        Serial.println("-> Obstáculo superado. Reanudando avance...");
       }
       break;
     }

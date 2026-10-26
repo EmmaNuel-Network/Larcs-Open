@@ -50,14 +50,20 @@ int medirSensorDirecto(int pinTrig, int pinEcho) {
   delayMicroseconds(10);
   digitalWrite(pinTrig, LOW);
 
-  // Timeout de 4500 us (~80 cm max). Previene congelamientos si no hay eco
+  // Timeout ajustado a 15000 us (~2.5 metros máximo)
   long duracion = pulseIn(pinEcho, HIGH, 15000); 
 
+  // Si no hay respuesta o la lectura es 0, asigna fuera de rango (999)
   if (duracion == 0) {
-    return 999; // Fuera de rango
+    return 999; 
   }
 
-  return (int)(duracion * 0.034 / 2);
+  int distancia = (int)(duracion * 0.034 / 2);
+  
+  // Evita falsos positivos por lecturas en 0
+  if (distancia <= 0) return 999; 
+
+  return distancia;
 }
 
 // 6. MUESTREO SECUENCIAL NO BLOQUEANTE (Anti-Ecos Fantasma)
