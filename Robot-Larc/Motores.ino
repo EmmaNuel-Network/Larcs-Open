@@ -1,85 +1,41 @@
 // ==========================================
-// PESTAÑA: Motores.ino (Control PD con Feedforward)
+// PESTAÑA: Motores.ino
+// Cinemática Holonómica, Encoders y Servomotores (GPIO 25 y 26)
 // ==========================================
 #include <Arduino.h>
 #include <Adafruit_MCP23X17.h>
 
 extern Adafruit_MCP23X17 mcp;
-// Declaración única de las instancias globales
-ControlPD pdM1, pdM2, pdM3, pdM4;
 
-// 2. ASIGNACIÓN DE PINES EN ESP32
-const int pinM1_IN1 = 0; // PA0
-const int pinM1_IN2 = 1; // PA1
-const int pinM1_PWM = 12; // ENA Módulo 1
-const int pinEncM1A = 34; // GPI: Requiere Pull-Up física
-const int pinEncM1B = 2; // GPI: Requiere Pull-Up física
+extern ControlPD pdM1, pdM2, pdM3, pdM4;
+extern const int pinServo25;
+extern const int pinServo26;
 
-const int pinM2_IN1 = 2; // PA2
-const int pinM2_IN2 = 3; // PA3
-const int pinM2_PWM = 13; // ENB Módulo 1
-const int pinEncM2A = 35; // GPI: Requiere Pull-Up física
-const int pinEncM2B = 5; // GPI: Requiere Pull-Up física
+// Drivers DC
+const int pinM1_IN1 = 0;  const int pinM1_IN2 = 1;  const int pinM1_PWM = 12; // Front-Izq
+const int pinM3_IN1 = 2;  const int pinM3_IN2 = 3;  const int pinM3_PWM = 13; // Rear-Izq
+const int pinM2_IN1 = 4;  const int pinM2_IN2 = 5;  const int pinM2_PWM = 14; // Front-Der
+const int pinM4_IN1 = 6;  const int pinM4_IN2 = 7;  const int pinM4_PWM = 27; // Rear-Der
 
-const int pinM3_IN1 = 4; // PA4
-const int pinM3_IN2 = 5; // PA5
-const int pinM3_PWM = 14; // ENA Módulo 2
-const int pinEncM3A = 4;
-const int pinEncM3B = 15;
+// Encoders
+const int pinEncM1A = 34; const int pinEncM1B = 2;
+const int pinEncM2A = 35; const int pinEncM2B = 5;
+const int pinEncM3A = 4;  const int pinEncM3B = 15;
+const int pinEncM4A = 17; const int pinEncM4B = 33;
 
-const int pinM4_IN1 = 6; // PA6
-const int pinM4_IN2 = 7; // PA7
-const int pinM4_PWM = 27; // ENB Módulo 2
-const int pinEncM4A = 17;
-const int pinEncM4B = 33;
-
-// 3. VARIABLES GLOBALES Y SECCIÓN CRÍTICA
-volatile long pulsosM1 = 0;
-volatile long pulsosM2 = 0;
-volatile long pulsosM3 = 0;
-volatile long pulsosM4 = 0;
-
+volatile long pulsosM1 = 0, pulsosM2 = 0, pulsosM3 = 0, pulsosM4 = 0;
 static portMUX_TYPE encoderMux = portMUX_INITIALIZER_UNLOCKED;
 
-const int VELOCIDAD_CRUCERO = 180;
-const int VELOCIDAD_GIRO    = 150;
-const int MIN_PWM_DEADBAND  = 35; 
-
-const float MAX_PULSOS_20MS = 60.0f; 
-
+const int MIN_PWM_DEADBAND = 35;
+const float MAX_PULSOS_20MS = 60.0f;
 unsigned long ultimoTiempoPD = 0;
-const unsigned long INTERVALO_PD_MS = 20; // 50 Hz
+const unsigned long INTERVALO_PD_MS = 20;
 
-// 4. RUTINAS DE INTERRUPCIÓN (ISR)
-void IRAM_ATTR contarM1() {
-  portENTER_CRITICAL_ISR(&encoderMux);
-  if (gpio_get_level((gpio_num_t)pinEncM1B)) pulsosM1++;
-  else pulsosM1--;
-  portEXIT_CRITICAL_ISR(&encoderMux);
-}
+void IRAM_ATTR contarM1() { portENTER_CRITICAL_ISR(&encoderMux); if (gpio_get_level((gpio_num_t)pinEncM1B)) pulsosM1++; else pulsosM1--; portEXIT_CRITICAL_ISR(&encoderMux); }
+void IRAM_ATTR contarM2() { portENTER_CRITICAL_ISR(&encoderMux); if (gpio_get_level((gpio_num_t)pinEncM2B)) pulsosM2++; else pulsosM2--; portEXIT_CRITICAL_ISR(&encoderMux); }
+void IRAM_ATTR contarM3() { portENTER_CRITICAL_ISR(&encoderMux); if (gpio_get_level((gpio_num_t)pinEncM3B)) pulsosM3++; else pulsosM3--; portEXIT_CRITICAL_ISR(&encoderMux); }
+void IRAM_ATTR contarM4() { portENTER_CRITICAL_ISR(&encoderMux); if (gpio_get_level((gpio_num_t)pinEncM4B)) pulsosM4++; else pulsosM4--; portEXIT_CRITICAL_ISR(&encoderMux); }
 
-void IRAM_ATTR contarM2() {
-  portENTER_CRITICAL_ISR(&encoderMux);
-  if (gpio_get_level((gpio_num_t)pinEncM2B)) pulsosM2++;
-  else pulsosM2--;
-  portEXIT_CRITICAL_ISR(&encoderMux);
-}
-
-void IRAM_ATTR contarM3() {
-  portENTER_CRITICAL_ISR(&encoderMux);
-  if (gpio_get_level((gpio_num_t)pinEncM3B)) pulsosM3++;
-  else pulsosM3--;
-  portEXIT_CRITICAL_ISR(&encoderMux);
-}
-
-void IRAM_ATTR contarM4() {
-  portENTER_CRITICAL_ISR(&encoderMux);
-  if (gpio_get_level((gpio_num_t)pinEncM4B)) pulsosM4++;
-  else pulsosM4--;
-  portEXIT_CRITICAL_ISR(&encoderMux);
-}
-
-// 5. LECTURAS ATÓMICAS Y REANUDACIÓN DE ENCODERS
 long getPulsosM1() { taskENTER_CRITICAL(&encoderMux); long p = pulsosM1; taskEXIT_CRITICAL(&encoderMux); return p; }
 long getPulsosM2() { taskENTER_CRITICAL(&encoderMux); long p = pulsosM2; taskEXIT_CRITICAL(&encoderMux); return p; }
 long getPulsosM3() { taskENTER_CRITICAL(&encoderMux); long p = pulsosM3; taskEXIT_CRITICAL(&encoderMux); return p; }
@@ -96,43 +52,6 @@ void resetEncoders() {
   pdM4.pulsosAnteriores = 0; pdM4.errorPrev = 0;
 }
 
-// 6. INICIALIZACIÓN
-void setupMotores() {
-  // Las asignaciones van DENTRO de la función setup
-  pdM1.Kp = 1.2f; pdM1.Kd = 0.15f;
-  pdM2.Kp = 1.2f; pdM2.Kd = 0.15f;
-  pdM3.Kp = 1.2f; pdM3.Kd = 0.15f;
-  pdM4.Kp = 1.2f; pdM4.Kd = 0.15f;
-
-  mcp.pinMode(pinM1_IN1, OUTPUT); mcp.pinMode(pinM1_IN2, OUTPUT);
-  mcp.pinMode(pinM2_IN1, OUTPUT); mcp.pinMode(pinM2_IN2, OUTPUT);
-  mcp.pinMode(pinM3_IN1, OUTPUT); mcp.pinMode(pinM3_IN2, OUTPUT);
-  mcp.pinMode(pinM4_IN1, OUTPUT); mcp.pinMode(pinM4_IN2, OUTPUT);
-
-pinMode(pinM1_PWM, OUTPUT);
-  pinMode(pinM2_PWM, OUTPUT);
-  pinMode(pinM3_PWM, OUTPUT);
-  pinMode(pinM4_PWM, OUTPUT);
-  
-  // -- ESTOS SON LOS QUE FALTAN --
-  pinMode(pinEncM1A, INPUT);        // Requiere Pull-Up físico
-  pinMode(pinEncM1B, INPUT_PULLUP); 
-  pinMode(pinEncM2A, INPUT);        // Requiere Pull-Up físico
-  pinMode(pinEncM2B, INPUT_PULLUP); 
-  // ------------------------------
-
-  pinMode(pinEncM3A, INPUT_PULLUP); pinMode(pinEncM3B, INPUT_PULLUP);
-  pinMode(pinEncM4A, INPUT_PULLUP); pinMode(pinEncM4B, INPUT_PULLUP);
-  
-  attachInterrupt(digitalPinToInterrupt(pinEncM1A), contarM1, RISING);
-  attachInterrupt(digitalPinToInterrupt(pinEncM2A), contarM2, RISING);
-  attachInterrupt(digitalPinToInterrupt(pinEncM3A), contarM3, RISING);
-  attachInterrupt(digitalPinToInterrupt(pinEncM4A), contarM4, RISING);
-
-  pararMotores();
-}
-
-// 7. COMPENSACIÓN DE ZONA MUERTA
 int aplicarDeadband(int pwm) {
   if (pwm == 0) return 0;
   int pwmAbs = abs(pwm);
@@ -140,23 +59,18 @@ int aplicarDeadband(int pwm) {
   return (pwm > 0) ? pwmAbs : -pwmAbs;
 }
 
-// 8. CONTROL FÍSICO DE DRIVERS
 void setDriverMotor(int pinIN1, int pinIN2, int pinPWM, int velocidad) {
   velocidad = aplicarDeadband(velocidad);
   if (velocidad > 0) {
-    mcp.digitalWrite(pinIN1, HIGH);
-    mcp.digitalWrite(pinIN2, LOW);
+    mcp.digitalWrite(pinIN1, HIGH); mcp.digitalWrite(pinIN2, LOW);
   } else if (velocidad < 0) {
-    mcp.digitalWrite(pinIN1, LOW);
-    mcp.digitalWrite(pinIN2, HIGH);
+    mcp.digitalWrite(pinIN1, LOW); mcp.digitalWrite(pinIN2, HIGH);
   } else {
-    mcp.digitalWrite(pinIN1, LOW);
-    mcp.digitalWrite(pinIN2, LOW);
+    mcp.digitalWrite(pinIN1, LOW); mcp.digitalWrite(pinIN2, LOW);
   }
   analogWrite(pinPWM, min(abs(velocidad), 255));
 }
 
-// 9. CÁLCULO PD CON FEEDFORWARD DE VELOCIDAD
 int calcularPDMotor(ControlPD &pd, long pulsosActuales, float dt) {
   if (pd.setpoint == 0.0f) {
     pd.errorPrev = 0.0f;
@@ -168,18 +82,14 @@ int calcularPDMotor(ControlPD &pd, long pulsosActuales, float dt) {
   pd.pulsosAnteriores = pulsosActuales;
 
   float pulsosObjetivo = (pd.setpoint / 255.0f) * MAX_PULSOS_20MS;
-
   float error = pulsosObjetivo - velocidadMedida;
-
   float derivativa = (dt > 0.0f) ? ((error - pd.errorPrev) / dt) : 0.0f;
   pd.errorPrev = error;
 
   float pwmCorregido = pd.setpoint + (pd.Kp * error) + (pd.Kd * derivativa);
-
   return (int)constrain(pwmCorregido, -255.0f, 255.0f);
 }
 
-// 10. BUCLE PERIÓDICO (Llamar continuamente en el loop principal)
 void actualizarControlMotores() {
   unsigned long tiempoActual = millis();
   if (tiempoActual - ultimoTiempoPD >= INTERVALO_PD_MS) {
@@ -192,13 +102,12 @@ void actualizarControlMotores() {
     pdM4.outputPWM = calcularPDMotor(pdM4, getPulsosM4(), dt);
 
     setDriverMotor(pinM1_IN1, pinM1_IN2, pinM1_PWM, pdM1.outputPWM);
-    setDriverMotor(pinM2_IN1, pinM2_IN2, pinM2_PWM, pdM2.outputPWM);
+    setDriverMotor(pinM2_IN1, pinM2_IN2, pinM2_PWM, -pdM2.outputPWM);
     setDriverMotor(pinM3_IN1, pinM3_IN2, pinM3_PWM, pdM3.outputPWM);
-    setDriverMotor(pinM4_IN1, pinM4_IN2, pinM4_PWM, pdM4.outputPWM);
+    setDriverMotor(pinM4_IN1, pinM4_IN2, pinM4_PWM, -pdM4.outputPWM);
   }
 }
 
-// 11. CINEMÁTICA HOLONÓMICA
 void moverOmni(int Vx, int Vy, int W) {
   int vM1 = Vy + Vx - W;
   int vM2 = Vy - Vx + W;
@@ -207,16 +116,12 @@ void moverOmni(int Vx, int Vy, int W) {
 
   int maxVel = max(max(abs(vM1), abs(vM2)), max(abs(vM3), abs(vM4)));
   if (maxVel > 255) {
-    vM1 = (vM1 * 255) / maxVel;
-    vM2 = (vM2 * 255) / maxVel;
-    vM3 = (vM3 * 255) / maxVel;
-    vM4 = (vM4 * 255) / maxVel;
+    vM1 = (vM1 * 255) / maxVel; vM2 = (vM2 * 255) / maxVel;
+    vM3 = (vM3 * 255) / maxVel; vM4 = (vM4 * 255) / maxVel;
   }
 
-  pdM1.setpoint = (float)vM1;
-  pdM2.setpoint = (float)vM2;
-  pdM3.setpoint = (float)vM3;
-  pdM4.setpoint = (float)vM4;
+  pdM1.setpoint = (float)vM1; pdM2.setpoint = (float)vM2;
+  pdM3.setpoint = (float)vM3; pdM4.setpoint = (float)vM4;
 }
 
 void pararMotores() {
@@ -229,4 +134,58 @@ void pararMotores() {
   setDriverMotor(pinM2_IN1, pinM2_IN2, pinM2_PWM, 0);
   setDriverMotor(pinM3_IN1, pinM3_IN2, pinM3_PWM, 0);
   setDriverMotor(pinM4_IN1, pinM4_IN2, pinM4_PWM, 0);
+}
+
+void setupMotores() {
+  pdM1.Kp = 1.2f; pdM1.Kd = 0.15f;
+  pdM2.Kp = 1.2f; pdM2.Kd = 0.15f;
+  pdM3.Kp = 1.2f; pdM3.Kd = 0.15f;
+  pdM4.Kp = 1.2f; pdM4.Kd = 0.15f;
+
+  mcp.pinMode(pinM1_IN1, OUTPUT); mcp.pinMode(pinM1_IN2, OUTPUT);
+  mcp.pinMode(pinM2_IN1, OUTPUT); mcp.pinMode(pinM2_IN2, OUTPUT);
+  mcp.pinMode(pinM3_IN1, OUTPUT); mcp.pinMode(pinM3_IN2, OUTPUT);
+  mcp.pinMode(pinM4_IN1, OUTPUT); mcp.pinMode(pinM4_IN2, OUTPUT);
+
+  pinMode(pinM1_PWM, OUTPUT); pinMode(pinM2_PWM, OUTPUT);
+  pinMode(pinM3_PWM, OUTPUT); pinMode(pinM4_PWM, OUTPUT);
+
+  pinMode(pinEncM1A, INPUT); pinMode(pinEncM1B, INPUT_PULLUP);
+  pinMode(pinEncM2A, INPUT); pinMode(pinEncM2B, INPUT_PULLUP);
+  pinMode(pinEncM3A, INPUT_PULLUP); pinMode(pinEncM3B, INPUT_PULLUP);
+  pinMode(pinEncM4A, INPUT_PULLUP); pinMode(pinEncM4B, INPUT_PULLUP);
+
+  attachInterrupt(digitalPinToInterrupt(pinEncM1A), contarM1, RISING);
+  attachInterrupt(digitalPinToInterrupt(pinEncM2A), contarM2, RISING);
+  attachInterrupt(digitalPinToInterrupt(pinEncM3A), contarM3, RISING);
+  attachInterrupt(digitalPinToInterrupt(pinEncM4A), contarM4, RISING);
+
+  resetEncoders();
+  pararMotores();
+}
+
+void moverPulsoServo(int pinGPIO, int angulo) {
+  int duracionUs = map(angulo, 0, 180, 500, 2400);
+  digitalWrite(pinGPIO, HIGH);
+  delayMicroseconds(duracionUs);
+  digitalWrite(pinGPIO, LOW);
+  delayMicroseconds(20000 - duracionUs);
+}
+
+void accionarRecolectorYClasificar(bool esValida) {
+  pararMotores();
+
+  int anguloCompuerta = esValida ? 0 : 90;
+  for (int i = 0; i < 15; i++) {
+    moverPulsoServo(pinServo26, anguloCompuerta);
+  }
+
+  for (int pos = 0; pos <= 80; pos += 10) {
+    for (int i = 0; i < 2; i++) moverPulsoServo(pinServo25, pos);
+  }
+  delay(100);
+
+  for (int pos = 80; pos >= 0; pos -= 10) {
+    for (int i = 0; i < 2; i++) moverPulsoServo(pinServo25, pos);
+  }
 }
