@@ -175,11 +175,15 @@ void moverPulsoServo(int pinGPIO, int angulo) {
 void accionarRecolectorYClasificar(bool esValida) {
   pararMotores();
 
+  // Servo 2 (GPIO 26): Compuerta Clasificadora
+  // 0 deg = Dejar Afuera (Roja/Amarilla/Naranja)
+  // 90 deg = Dejar Adentro (Azul/Negra)
   int anguloCompuerta = esValida ? 0 : 90;
   for (int i = 0; i < 15; i++) {
     moverPulsoServo(pinServo26, anguloCompuerta);
   }
 
+  // Servo 1 (GPIO 25): Garra Recolectora
   for (int pos = 0; pos <= 80; pos += 10) {
     for (int i = 0; i < 2; i++) moverPulsoServo(pinServo25, pos);
   }
