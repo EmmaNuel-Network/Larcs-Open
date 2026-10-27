@@ -21,7 +21,7 @@ struct ControlPD {
 
 ControlPD pdM1, pdM2, pdM3, pdM4;
 
-// 3. ESTADOS DE LA MÁQUINA DE ESTADOS FINITOS (ESTRATEGIA TRES NIVELES)
+// 3. ESTADOS DE LA MÁQUINA DE ESTADOS FINITOS (3 NIVELES)
 enum EstadoFSM {
   ESPERA_INICIO,
   IR_A_CULTIVO,
@@ -71,8 +71,8 @@ unsigned long tiempoInicioMision = 0;
 unsigned long tiempoInicioEstado = 0;
 int direccionBarrido = 1;
 
-const int pinServo25 = 25; // Servo Garra
-const int pinServo26 = 26; // Servo Clasificador
+const int pinServo25 = 25; // Servo Garra Recolectora
+const int pinServo26 = 26; // Servo Compuerta Clasificadora
 
 void esperarConControl(unsigned long ms) {
   unsigned long inicio = millis();
@@ -88,7 +88,7 @@ bool consultarColorPelotaRPi() {
   pararMotores();
   
   while (Serial.available() > 0) { Serial.read(); }
-  Serial.write('C');
+  Serial.write('C'); // Envia orden de clasificación
   
   unsigned long tInicio = millis();
   char respuesta = '0';
@@ -101,10 +101,10 @@ bool consultarColorPelotaRPi() {
     delay(5);
   }
   
-  return (respuesta == '1');
+  return (respuesta == '1'); // '1' = Dejar Afuera | '0' = Dejar Adentro
 }
 
-// 7. BARRIDO COMPLETO DE UN NIVEL (3 ÁRBOLES)
+// 7. BARRIDO COMPLETO DE UN NIVEL (3 ÁRBOLES X 4 PELOTAS)
 void ejecutarBarridoNivel(int direccion) {
   for (int arbol = 1; arbol <= 3; arbol++) {
     for (int pelota = 1; pelota <= 4; pelota++) {
@@ -146,6 +146,7 @@ void setup() {
   digitalWrite(pinServo25, LOW);
   digitalWrite(pinServo26, LOW);
 
+  // Test inicial de movimiento de servos
   accionarRecolectorYClasificar(true);
 
   delay(1000);
@@ -213,7 +214,7 @@ void loop() {
       esperarConControl(TIEMPO_CAMBIO_NIVEL_MS);
       pararMotores();
       
-      direccionBarrido = -1;
+      direccionBarrido = -1; // Sentido opuesto para el Nivel 2
       estadoActual = RECOLECCION_NIVEL_2;
       break;
 
@@ -228,7 +229,7 @@ void loop() {
       esperarConControl(TIEMPO_CAMBIO_NIVEL_MS);
       pararMotores();
       
-      direccionBarrido = 1;
+      direccionBarrido = 1; // Sentido opuesto para el Nivel 3
       estadoActual = RECOLECCION_NIVEL_3;
       break;
 
