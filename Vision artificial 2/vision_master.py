@@ -13,6 +13,10 @@ from vision_general2 import (
 )
 from cone_UART import ConexionUART
 
+# --- CONFIGURACIÓN DE RENDIMIENTO E INTERFAZ ---
+# Cambiar a True si deseas ver las ventanas gráficas durante pruebas de desarrollo
+MOSTRAR_VIDEO = False
+
 # --- CONFIGURACIÓN DE CÁMARA USB HD 1080P ---
 ANCHO_FRAME = 640
 ALTO_FRAME = 480
@@ -21,16 +25,13 @@ CENTRO_Y = ALTO_FRAME // 2
 
 TOLERANCIA_CENTRADO_X = 18  # Tolerancia de centrado en píxeles
 
-# --- RANGOS DE COLOR HSV (Ajustar en calibrar_vision.py) ---
-# Árbol (Verde)
+# --- RANGOS DE COLOR HSV (Actualizar según calibrar_vision.py) ---
 verde_arbol_lower = np.array([35, 40, 40])
 verde_arbol_upper = np.array([85, 255, 255])
 
-# Piscinas y Contenedor Azul (Azul)
 azul_lower = np.array([100, 80, 50])
 azul_upper = np.array([130, 255, 255])
 
-# Pelotas Maduras (Rojo / Naranja / Amarillo)
 amarillo_lower = np.array([15, 80, 100])
 amarillo_upper = np.array([35, 255, 255])
 
@@ -39,7 +40,6 @@ rojo_upper1 = np.array([10, 255, 255])
 rojo_lower2 = np.array([160, 100, 100])
 rojo_upper2 = np.array([179, 255, 255])
 
-# Pelotas Sobremaduras (Negro)
 negro_lower = np.array([0, 0, 0])
 negro_upper = np.array([180, 255, 45])
 
@@ -50,7 +50,8 @@ cap.set(cv.CAP_PROP_FRAME_HEIGHT, ALTO_FRAME)
 
 uart = ConexionUART(puerto='/dev/ttyS0', baudrate=115200)
 
-print("[VISION MASTER] Sistema iniciado. Esperando órdenes UART de ESP32...")
+print("[VISION MASTER] Sistema iniciado a 640x480. Esperando órdenes UART de ESP32...")
+print(f"[VISION MASTER] Modo gráfico activo: {MOSTRAR_VIDEO}")
 
 try:
     while cap.isOpened():
@@ -79,10 +80,10 @@ try:
                 err_x = cx - CENTRO_X
                 err_y = cy - CENTRO_Y
                 esta_centrado = (abs(err_x) <= 30)
-                cv.circle(frame, (cx, cy), 10, (0, 255, 0), -1)
+                if MOSTRAR_VIDEO:
+                    cv.circle(frame, (cx, cy), 10, (0, 255, 0), -1)
 
         elif modo_activo == "PELOTAS":
-            # Segmentar solo pelotas cosechables (Maduras y Sobremaduras)
             mascara_roja = cv.bitwise_or(
                 cv.inRange(hsv, rojo_lower1, rojo_upper1),
                 cv.inRange(hsv, rojo_lower2, rojo_upper2)
@@ -97,11 +98,10 @@ try:
             )
 
             pelotas = detectar_circulos(
-                mascara_cosechables, "Pelota Cosechable", area_min=150, area_max=8000, circularidad_min=0.75
+                mascara_cosechables, "Pelota Cosechable", area_min=600, area_max=32000, circularidad_min=0.75
             )
 
             if pelotas:
-                # Seleccionar la pelota más cercana al centro horizontal
                 pelota_objetivo = min(pelotas, key=lambda p: abs(p["centro"][0] - CENTRO_X))
                 cx, cy = pelota_objetivo["centro"]
 
@@ -109,42 +109,53 @@ try:
                 err_y = cy - CENTRO_Y
                 esta_centrado = (abs(err_x) <= TOLERANCIA_CENTRADO_X)
 
-                # Dibujar objetivo en pantalla
-                cv.circle(frame, (cx, cy), pelota_objetivo["radio"], (0, 255, 255), 2)
-                cv.line(frame, (CENTRO_X, CENTRO_Y), (cx, cy), (255, 0, 0), 2)
+                if MOSTRAR_VIDEO:
+                    cv.circle(frame, (cx, cy), pelota_objetivo["radio"], (0, 255, 255), 2)
+                    cv.line(frame, (CENTRO_X, CENTRO_Y), (cx, cy), (255, 0, 0), 2)
 
         elif modo_activo == "PISCINAS":
             mascara_azul = cv.inRange(hsv, azul_lower, azul_upper)
             piscinas = detectar_rectangulos_orientados(
-                mascara_azul, "Piscina", area_min=1200, aspect_ratio_range=(2.0, 5.0)
+                mascara_azul, "Piscina", area_min=4800, aspect_ratio_range=(2.0, 5.0)
             )
             if piscinas:
                 cx, cy = piscinas[0]["centro"]
                 err_x = cx - CENTRO_X
+                esta_centrado = (abs(err_x) <= TOLERANCIA_CENTRADO_X)
 
         elif modo_activo == "CONTENEDORES":
+            # Combinar máscaras azul y roja para detectar cualquiera de los dos depósitos
             mascara_azul = cv.inRange(hsv, azul_lower, azul_upper)
+            mascara_roja = cv.bitwise_or(
+                cv.inRange(hsv, rojo_lower1, rojo_upper1),
+                cv.inRange(hsv, rojo_lower2, rojo_upper2)
+            )
+            mascara_contenedores = cv.bitwise_or(mascara_azul, mascara_roja)
+
             contenedores = detectar_rectangulos_orientados(
-                mascara_azul, "Contenedor Azul", area_min=1000, aspect_ratio_range=(0.8, 1.25)
+                mascara_contenedores, "Contenedor", area_min=4000, aspect_ratio_range=(0.8, 1.25)
             )
             if contenedores:
                 cx, cy = contenedores[0]["centro"]
                 err_x = cx - CENTRO_X
+                err_y = cy - CENTRO_Y
+                esta_centrado = (abs(err_x) <= TOLERANCIA_CENTRADO_X)
 
-        # 4. Transmitir error y estado de centrado a ESP32 (Opción A)
+        # 4. Transmitir error y estado de centrado a ESP32 por UART
         uart.enviar_error_camara(err_x, err_y, esta_centrado)
 
-        # Visualización local para monitoreo
-        cv.putText(frame, f"Modo: {modo_activo} | ErrX: {err_x} | Centrado: {esta_centrado}", 
-                   (10, 30), cv.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-        cv.imshow("Vision Raspberry Pi 4", frame)
-
-        if cv.waitKey(1) & 0xFF == ord('q'):
-            break
-
-        time.sleep(0.03) # ~30 FPS
+        # Visualización local opcional
+        if MOSTRAR_VIDEO:
+            cv.putText(frame, f"Modo: {modo_activo} | ErrX: {err_x} | Centrado: {esta_centrado}", 
+                       (10, 30), cv.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+            cv.imshow("Vision Raspberry Pi 4", frame)
+            if cv.waitKey(1) & 0xFF == ord('q'):
+                break
+        else:
+            time.sleep(0.01)
 
 finally:
     cap.release()
-    cv.destroyAllWindows()
+    if MOSTRAR_VIDEO:
+        cv.destroyAllWindows()
     uart.cerrar()

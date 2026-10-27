@@ -7,7 +7,7 @@ import numpy as np
 
 KERNEL = np.ones((5, 5), np.uint8)
 
-def detectar_circulos(mascara, nombre_tipo, area_min=150, area_max=10000, circularidad_min=0.75):
+def detectar_circulos(mascara, nombre_tipo, area_min=600, area_max=32000, circularidad_min=0.75):
     """Detecta objetos esféricos (pelotas) asegurando alta circularidad."""
     detecciones = []
     mascara_limpia = cv.morphologyEx(mascara, cv.MORPH_OPEN, KERNEL)
