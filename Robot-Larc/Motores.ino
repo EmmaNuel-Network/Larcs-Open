@@ -2,33 +2,37 @@
 // PESTAÑA: Motores.ino (Control PD con Feedforward)
 // ==========================================
 #include <Arduino.h>
+#include <Adafruit_MCP23X17.h>
 
-// 1. ASIGNACIÓN DE PINES EN ESP32
-const int pinM1_IN1 = 5;
-const int pinM1_IN2 = 13;
-const int pinM1_PWM = 14;
-const int pinEncM1A = 34; // GPI: Requiere Pull-Up física
-const int pinEncM1B = 35; // GPI: Requiere Pull-Up física
+extern Adafruit_MCP23X17 mcp;
+// Declaración única de las instancias globales
+ControlPD pdM1, pdM2, pdM3, pdM4;
 
-const int pinM2_IN1 = 25;
-const int pinM2_IN2 = 26;
-const int pinM2_PWM = 27;
-const int pinEncM2A = 36; // GPI: Requiere Pull-Up física
-const int pinEncM2B = 39; // GPI: Requiere Pull-Up física
+// ==========================================
+// ASIGNACIÓN DE PINES CORREGIDA EN Motores.ino
+// ==========================================
+const int pinM1_IN1 = 0;  // PA0
+const int pinM1_IN2 = 1;  // PA1
+const int pinM1_PWM = 12; // ENA (GPIO 12)
 
-const int pinM3_IN1 = 26;
-const int pinM3_IN2 = 15;
-const int pinM3_PWM = 4;
-const int pinEncM3A = 32;
-const int pinEncM3B = 33;
+const int pinM3_IN1 = 2;  // PA2 (IN3 en Driver Izq)
+const int pinM3_IN2 = 3;  // PA3 (IN4 en Driver Izq)
+const int pinM3_PWM = 13; // ENB (GPIO 13)
 
-const int pinM4_IN1 = 18;
-const int pinM4_IN2 = 19;
-const int pinM4_PWM = 21;
-const int pinEncM4A = 22;
-const int pinEncM4B = 23;
+const int pinM2_IN1 = 4;  // PA4 (IN1 en Driver Der)
+const int pinM2_IN2 = 5;  // PA5 (IN2 en Driver Der)
+const int pinM2_PWM = 14; // ENA (GPIO 14)
 
-// 2. VARIABLES GLOBALES Y SECCIÓN CRÍTICA
+const int pinM4_IN1 = 6;  // PA6 (IN3 en Driver Der)
+const int pinM4_IN2 = 7;  // PA7 (IN4 en Driver Der)
+const int pinM4_PWM = 27; // ENB (GPIO 27)
+
+const int pinEncM1A = 34; const int pinEncM1B = 2;   // Delantero Izq
+const int pinEncM2A = 35; const int pinEncM2B = 5;   // Delantero Der
+const int pinEncM3A = 4;  const int pinEncM3B = 15;  // Trasero Izq
+const int pinEncM4A = 17; const int pinEncM4B = 33;  // Trasero Der
+
+// 3. VARIABLES GLOBALES Y SECCIÓN CRÍTICA
 volatile long pulsosM1 = 0;
 volatile long pulsosM2 = 0;
 volatile long pulsosM3 = 0;
@@ -40,12 +44,7 @@ const int VELOCIDAD_CRUCERO = 180;
 const int VELOCIDAD_GIRO    = 150;
 const int MIN_PWM_DEADBAND  = 35; 
 
-// Calibración de velocidad máxima: Máximo de pulsos leídos en 20ms a PWM 255
-// (Ajustar este valor midiendo los pulsos reales a máxima velocidad)
 const float MAX_PULSOS_20MS = 60.0f; 
-
-
-ControlPD pdM1, pdM2, pdM3, pdM4;
 
 unsigned long ultimoTiempoPD = 0;
 const unsigned long INTERVALO_PD_MS = 20; // 50 Hz
@@ -98,17 +97,32 @@ void resetEncoders() {
 
 // 6. INICIALIZACIÓN
 void setupMotores() {
-  pinMode(pinM1_IN1, OUTPUT); pinMode(pinM1_IN2, OUTPUT); pinMode(pinM1_PWM, OUTPUT);
-  pinMode(pinM2_IN1, OUTPUT); pinMode(pinM2_IN2, OUTPUT); pinMode(pinM2_PWM, OUTPUT);
-  pinMode(pinM3_IN1, OUTPUT); pinMode(pinM3_IN2, OUTPUT); pinMode(pinM3_PWM, OUTPUT);
-  pinMode(pinM4_IN1, OUTPUT); pinMode(pinM4_IN2, OUTPUT); pinMode(pinM4_PWM, OUTPUT);
+  // Las asignaciones van DENTRO de la función setup
+  pdM1.Kp = 1.2f; pdM1.Kd = 0.15f;
+  pdM2.Kp = 1.2f; pdM2.Kd = 0.15f;
+  pdM3.Kp = 1.2f; pdM3.Kd = 0.15f;
+  pdM4.Kp = 1.2f; pdM4.Kd = 0.15f;
 
-  pinMode(pinEncM1A, INPUT); pinMode(pinEncM1B, INPUT);
-  pinMode(pinEncM2A, INPUT); pinMode(pinEncM2B, INPUT);
+  mcp.pinMode(pinM1_IN1, OUTPUT); mcp.pinMode(pinM1_IN2, OUTPUT);
+  mcp.pinMode(pinM2_IN1, OUTPUT); mcp.pinMode(pinM2_IN2, OUTPUT);
+  mcp.pinMode(pinM3_IN1, OUTPUT); mcp.pinMode(pinM3_IN2, OUTPUT);
+  mcp.pinMode(pinM4_IN1, OUTPUT); mcp.pinMode(pinM4_IN2, OUTPUT);
+
+  pinMode(pinM1_PWM, OUTPUT);
+  pinMode(pinM2_PWM, OUTPUT);
+  pinMode(pinM3_PWM, OUTPUT);
+  pinMode(pinM4_PWM, OUTPUT);
   
+  // -- ESTOS SON LOS QUE FALTAN --
+  pinMode(pinEncM1A, INPUT);        // Requiere Pull-Up físico
+  pinMode(pinEncM1B, INPUT_PULLUP); 
+  pinMode(pinEncM2A, INPUT);        // Requiere Pull-Up físico
+  pinMode(pinEncM2B, INPUT_PULLUP); 
+  // ------------------------------
+
   pinMode(pinEncM3A, INPUT_PULLUP); pinMode(pinEncM3B, INPUT_PULLUP);
   pinMode(pinEncM4A, INPUT_PULLUP); pinMode(pinEncM4B, INPUT_PULLUP);
-
+  
   attachInterrupt(digitalPinToInterrupt(pinEncM1A), contarM1, RISING);
   attachInterrupt(digitalPinToInterrupt(pinEncM2A), contarM2, RISING);
   attachInterrupt(digitalPinToInterrupt(pinEncM3A), contarM3, RISING);
@@ -129,14 +143,14 @@ int aplicarDeadband(int pwm) {
 void setDriverMotor(int pinIN1, int pinIN2, int pinPWM, int velocidad) {
   velocidad = aplicarDeadband(velocidad);
   if (velocidad > 0) {
-    digitalWrite(pinIN1, HIGH);
-    digitalWrite(pinIN2, LOW);
+    mcp.digitalWrite(pinIN1, HIGH);
+    mcp.digitalWrite(pinIN2, LOW);
   } else if (velocidad < 0) {
-    digitalWrite(pinIN1, LOW);
-    digitalWrite(pinIN2, HIGH);
+    mcp.digitalWrite(pinIN1, LOW);
+    mcp.digitalWrite(pinIN2, HIGH);
   } else {
-    digitalWrite(pinIN1, LOW);
-    digitalWrite(pinIN2, LOW);
+    mcp.digitalWrite(pinIN1, LOW);
+    mcp.digitalWrite(pinIN2, LOW);
   }
   analogWrite(pinPWM, min(abs(velocidad), 255));
 }
@@ -149,21 +163,16 @@ int calcularPDMotor(ControlPD &pd, long pulsosActuales, float dt) {
     return 0;
   }
 
-  // A. Medir velocidad real en pulsos por dt
   float velocidadMedida = (float)(pulsosActuales - pd.pulsosAnteriores);
   pd.pulsosAnteriores = pulsosActuales;
 
-  // B. Escalar la consigna PWM a pulsos objetivo equivalentes
   float pulsosObjetivo = (pd.setpoint / 255.0f) * MAX_PULSOS_20MS;
 
-  // C. Error de velocidad
   float error = pulsosObjetivo - velocidadMedida;
 
-  // D. Término derivativo
   float derivativa = (dt > 0.0f) ? ((error - pd.errorPrev) / dt) : 0.0f;
   pd.errorPrev = error;
 
-  // E. Feedforward (setpoint base) + Corrección PD
   float pwmCorregido = pd.setpoint + (pd.Kp * error) + (pd.Kd * derivativa);
 
   return (int)constrain(pwmCorregido, -255.0f, 255.0f);
@@ -173,29 +182,27 @@ int calcularPDMotor(ControlPD &pd, long pulsosActuales, float dt) {
 void actualizarControlMotores() {
   unsigned long tiempoActual = millis();
   if (tiempoActual - ultimoTiempoPD >= INTERVALO_PD_MS) {
-    float dt = (tiempoActual - ultimoTiempoPD) / 1000.0f; // dt en segundos
+    float dt = (tiempoActual - ultimoTiempoPD) / 1000.0f;
     ultimoTiempoPD = tiempoActual;
 
-    // Calcular la velocidad con corrección PD
     pdM1.outputPWM = calcularPDMotor(pdM1, getPulsosM1(), dt);
     pdM2.outputPWM = calcularPDMotor(pdM2, getPulsosM2(), dt);
     pdM3.outputPWM = calcularPDMotor(pdM3, getPulsosM3(), dt);
     pdM4.outputPWM = calcularPDMotor(pdM4, getPulsosM4(), dt);
 
-    // Enviar a los drivers físicos
     setDriverMotor(pinM1_IN1, pinM1_IN2, pinM1_PWM, pdM1.outputPWM);
-    setDriverMotor(pinM2_IN1, pinM2_IN2, pinM2_PWM, pdM2.outputPWM);
+    setDriverMotor(pinM2_IN1, pinM2_IN2, pinM2_PWM, -pdM2.outputPWM);
     setDriverMotor(pinM3_IN1, pinM3_IN2, pinM3_PWM, pdM3.outputPWM);
-    setDriverMotor(pinM4_IN1, pinM4_IN2, pinM4_PWM, pdM4.outputPWM);
+    setDriverMotor(pinM4_IN1, pinM4_IN2, pinM4_PWM, -pdM4.outputPWM);
   }
 }
 
 // 11. CINEMÁTICA HOLONÓMICA
 void moverOmni(int Vx, int Vy, int W) {
-  int vM1 = Vy + Vx - W; // Frontal Izquierdo
-  int vM2 = Vy - Vx + W; // Frontal Derecho
-  int vM3 = Vy - Vx - W; // Trasero Izquierdo
-  int vM4 = Vy + Vx + W; // Trasero Derecho
+  int vM1 = Vy + Vx - W;
+  int vM2 = Vy - Vx + W;
+  int vM3 = Vy - Vx - W;
+  int vM4 = Vy + Vx + W;
 
   int maxVel = max(max(abs(vM1), abs(vM2)), max(abs(vM3), abs(vM4)));
   if (maxVel > 255) {
@@ -205,7 +212,6 @@ void moverOmni(int Vx, int Vy, int W) {
     vM4 = (vM4 * 255) / maxVel;
   }
 
-  // Asigna el Setpoint PWM base
   pdM1.setpoint = (float)vM1;
   pdM2.setpoint = (float)vM2;
   pdM3.setpoint = (float)vM3;
