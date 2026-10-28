@@ -101,13 +101,9 @@ unsigned long ultimaLecturaCamara = 0;
 char bufferUART[64];
 size_t idxBuffer = 0;
 
-//Constantes de Control Proporcional para centrado
+// Constantes de Control Proporcional para centrado
 const float KP_CENTRADO = 0.65;
-const int VELOCIDAD_MAX_CENTRADO = 90; //Límite de velocidad en PWM
-
-//Constantes de Control Proporcional para centrado
-const float KP_CENTRADO = 0.65;
-const int VELOCIDAD_MAX_CENTRADO = 90; //Límite de velocidad en PWM
+const int VELOCIDAD_MAX_CENTRADO = 90; // Límite de velocidad en PWM
 
 // ==========================================
 // 6. FUNCIONES EXTERNAS (otras pestañas)
@@ -180,9 +176,7 @@ bool estadoPermitido(EstadoFSM e) {
   return false;
 }
 
-// parar = true detiene motores al cambiar (como hacía la prueba en los
-// cambios AVANZAR->ESQUIVAR y VERIFICAR->AVANZAR); false mantiene el movimiento.
-// CÓDIGO CON INTEGRACIÓN DE VISIÓN:
+// CÓDIGO CON INTEGRACIÓN DE VISIÓN (Envía comandos a la Raspberry Pi)
 void cambiarEstado(EstadoFSM nuevoEstado, bool parar) {
   if (nuevoEstado == estadoActual) return;
 
@@ -201,6 +195,34 @@ void cambiarEstado(EstadoFSM nuevoEstado, bool parar) {
   estadoActual = nuevoEstado;
   estadoIniciado = false;
   tiempoInicioEstado = millis();
+
+  // ==========================================================
+  // NOTIFICACIÓN AUTOMÁTICA DE MODO A LA RASPBERRY PI
+  // ==========================================================
+  switch (estadoActual) {
+    case IR_A_CULTIVO:
+    case ESQUIVAR_PISCINA:
+    case VERIFICAR_LIBERACION:
+      Serial2.println("PISCINAS");
+      break;
+
+    case HOMING_Y_ESCUADRADO:
+      Serial2.println("ARBOLES");
+      break;
+
+    case RECOLECCION_MULTINIVEL:
+    case ALINEAR_Y_CAPTURAR:
+      Serial2.println("PELOTAS");
+      break;
+
+    case REGRESO_BENEFICIADERO:
+    case DESCARGA_PAYLOAD:
+      Serial2.println("CONTENEDORES");
+      break;
+
+    default:
+      break;
+  }
 }
 
 // ==========================================
@@ -240,7 +262,7 @@ void ejecutarMecanismoRecolector() {
 }
 
 // ==========================================
-// 9. UART ESP32-CAM
+// 9. UART ESP32-CAM / RASPBERRY PI
 // ==========================================
 void parsearTrama(char* trama) {
   int errX, errY, centrado;
@@ -271,7 +293,7 @@ void procesarCamaraVision() {
 // ==========================================
 void setup() {
   Serial.begin(115200);
-  Serial2.begin(115200, SERIAL_8N1, 16, 26); // TODO: TX 26 choca con servo 2
+  Serial2.begin(115200, SERIAL_8N1, 16, 26); // TX 26, RX 16
 
   Wire.begin(21, 22);
   if (!mcp.begin_I2C()) {
@@ -290,8 +312,6 @@ void setup() {
     mcp.pinMode(pinDirElevador, OUTPUT);
   }
 
-  // El servo solo se activa cuando se necesita: ESP32Servo y analogWrite
-  // comparten temporizadores LEDC y así no afecta las pruebas de navegación.
   if (USAR_SERVO) {
     servoCompuerta.attach(pinServoCompuerta);
     servoCompuerta.write(0);
@@ -302,11 +322,20 @@ void setup() {
     estadoActual = ESPERA_INICIO;
     Serial.println("--- COMPETENCIA: esperando botón de inicio ---");
   } else {
-    delay(2000); // Pausa de seguridad (igual que la prueba)
+    delay(2000); // Pausa de seguridad
     estadoActual = estadoInicial();
     tiempoInicioMision = millis();
     tiempoInicioEstado = millis();
     Serial.printf("--- MODO PRUEBA: arranca en %s ---\n", nombreEstado(estadoActual));
+
+    // Notificar el modo inicial a la Raspberry Pi según el estado de arranque
+    switch (estadoActual) {
+      case IR_A_CULTIVO:           Serial2.println("PISCINAS"); break;
+      case HOMING_Y_ESCUADRADO:    Serial2.println("ARBOLES"); break;
+      case RECOLECCION_MULTINIVEL: Serial2.println("PELOTAS"); break;
+      case REGRESO_BENEFICIADERO:  Serial2.println("CONTENEDORES"); break;
+      default: break;
+    }
   }
 }
 
@@ -324,7 +353,7 @@ void loop() {
     errorCamaraY = 0;
   }
 
-  // --- Ultrasonidos (misma lógica que la prueba funcional) ---
+  // --- Ultrasonidos ---
   int distFrontal = leerUltrasonidoAlto();
   int distLateral = leerUltrasonidoLateral();
 
@@ -333,7 +362,7 @@ void loop() {
   else if (distFrontal < 999)                 distParedEfectiva = distFrontal;
   else if (distLateral < 999)                 distParedEfectiva = distLateral;
 
-  // --- Infrarrojos (solo si el modo los usa) ---
+  // --- Infrarrojos ---
   bool lineaFrontal = false, margenIzq = false, margenDer = false;
   if (LEER_IR) {
     lineaFrontal = estaSobreLineaFrontal();
@@ -354,7 +383,7 @@ void loop() {
       }
       break;
 
-    // ---------- NAVEGACIÓN (lógica probada) ----------
+    // ---------- NAVEGACIÓN ----------
     case IR_A_CULTIVO:
       moverOmni(0, VELOCIDAD_BASE, 0);
 
@@ -380,7 +409,6 @@ void loop() {
         Serial.println("-> Frente despejado. Verificando liberación...");
         cambiarEstado(VERIFICAR_LIBERACION, false);
       }
-      // TODO: timeout y cambio de dirección con márgenes IR (siempre esquiva a la derecha)
       break;
     }
 
@@ -399,9 +427,8 @@ void loop() {
       break;
     }
 
-    // ---------- HOMING (esqueleto) ----------
+    // ---------- HOMING ----------
     case HOMING_Y_ESCUADRADO:
-      // TODO: escuadrado con los IR frontales antes del strafe
       if (margenIzq || millis() - tiempoInicioEstado > TIMEOUT_HOMING) {
         if (!margenIzq) Serial.println("[HOMING] Timeout sin ver margen izquierdo");
         resetEncoders();
@@ -415,10 +442,8 @@ void loop() {
       moverOmni(-150, 0, 0);
       break;
 
-    // ---------- RECOLECCIÓN (esqueleto) ----------
+    // ---------- RECOLECCIÓN ----------
     case RECOLECCION_MULTINIVEL:
-      // TODO: el árbol sigue al frente después de capturar, así que esta
-      // condición vuelve a disparar de inmediato. Definir el disparo con la cámara.
       if (distFrontal >= 3 && distFrontal < 25) {
         cambiarEstado(ALINEAR_Y_CAPTURAR, true);
         break;
@@ -447,20 +472,16 @@ void loop() {
         ejecutarMecanismoRecolector();
         cambiarEstado(RECOLECCION_MULTINIVEL, true);
       } else {
-        // Control proporcional con desviación
-        int vx= 0;
-        if(abs(errorCamaraX) >12){//Zona muerta de 12 px
-          vx= constrain((int)(errorCamaraX * KP_CENTRADO), -VELOCIDAD_MAX_CENTRADO, VELOCIDAD_MAX_CENTRADO);
+        int vx = 0;
+        if (abs(errorCamaraX) > 12) { // Zona muerta de 12 px
+          vx = constrain((int)(errorCamaraX * KP_CENTRADO), -VELOCIDAD_MAX_CENTRADO, VELOCIDAD_MAX_CENTRADO);
         }
         moverOmni(vx, 0, 0);
       }
       break;
 
-    // ---------- REGRESO Y DESCARGA (esqueleto) ----------
+    // ---------- REGRESO Y DESCARGA ----------
     case REGRESO_BENEFICIADERO:
-      // TODO: al entrar, el IR frontal puede seguir sobre la línea del cultivo
-      // -> agregar ventana de ignorar línea desde la entrada al estado.
-      // TODO: en reversa los ultrasonidos apuntan al lado contrario.
       if (lineaFrontal) {
         cambiarEstado(DESCARGA_PAYLOAD, true);
         break;
