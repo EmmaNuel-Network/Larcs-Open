@@ -54,7 +54,7 @@ enum ModoPrueba {
 };
 
 // >>>>>>>>>> CAMBIAR AQUÍ EL MODO Y VOLVER A SUBIR <<<<<<<<<<
-const ModoPrueba MODO = PRUEBA_ESQUIVA;
+const ModoPrueba MODO = PRUEBA_SENSORES;
 
 // Subsistemas que se activan según el modo
 const bool LEER_IR        = (MODO != PRUEBA_ESQUIVA);
