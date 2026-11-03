@@ -1,9 +1,10 @@
 // ==========================================
 // PESTAÑA PRINCIPAL: Robot-Larc.ino
 // FSM única + modos de prueba incrementales
-// Navegación completa: ida con esquiva, escuadrado, homing, barrido
-// de 3 niveles, regreso, posicionamiento y descarga.
-// (Visión y recolección se integran después en el BARRIDO)
+// Navegación completa + recolección: ida con esquiva, escuadrado, homing,
+// barrido de 3 niveles con captura pelota a pelota, regreso y descarga.
+// La decisión de capturar cada pelota se toma en el estado PELOTA_DECIDIR:
+// hoy "todas" o manual por Serial; luego la visión de la ESP32-CAM.
 // ==========================================
 #include <Arduino.h>
 #include <ESP32Servo.h>
@@ -33,7 +34,12 @@ enum EstadoFSM {
   HOMING_MARGEN,          // Strafe a la izquierda hasta el margen izquierdo
   BARRIDO,                // Recorre la fila de árboles de margen a margen, 3 niveles
   CENTRAR_FILA,           // Vuelve al centro de la fila antes de regresar
-  ALINEAR_Y_CAPTURAR,     // Reservado para la visión (aún no se usa)
+  ARBOL_REFINAR,          // Mide el borde del árbol con precisión (ida y vuelta lenta)
+  PELOTA_IR,              // Strafe hasta la posición de la pelota en el árbol
+  PELOTA_DECIDIR,         // ¿Se captura? (todas / Serial / cámara)
+  PELOTA_ACERCAR,         // Avanza hacia el árbol
+  PELOTA_CAPTURAR,        // Secuencia de la garra (y elevador en nivel 3)
+  PELOTA_RETIRAR,         // Vuelve a la distancia de la línea
   GIRO_180,               // Media vuelta controlada por odometría
   POSICIONAR_DESCARGA,    // Strafe hasta quedar frente al recipiente
   RETROCEDER_DESCARGA,    // Acerca la compuerta trasera al recipiente
@@ -56,7 +62,10 @@ enum ModoPrueba {
   PRUEBA_IDA,           // Salida -> esquiva -> línea del cultivo -> escuadra -> homing
   PRUEBA_BARRIDO,       // Frente a la línea del cultivo: escuadra -> homing -> 3 niveles
   PRUEBA_REGRESO,       // En la línea del cultivo: giro -> vuelta -> descarga
-  PRUEBA_RUTINA,        // Rutina completa de navegación (con monitor)
+  PRUEBA_MECANISMO,     // Robot quieto: elevador, garra y compuerta por Serial
+  PRUEBA_CAPTURA,       // Frente a una pelota: decide, acerca, captura, retira ('r' repite)
+  PRUEBA_RECOLECCION,   // Frente a la línea del cultivo: barrido de 3 niveles CON capturas
+  PRUEBA_RUTINA,        // Rutina completa (con monitor)
   COMPETENCIA           // Rutina completa: arranca sola tras RETARDO_ARRANQUE_MS
 };
 
@@ -64,14 +73,24 @@ enum ModoPrueba {
 const ModoPrueba MODO = PRUEBA_GIRO;
 
 // Subsistemas según el modo
-const bool LEER_IR = (MODO != PRUEBA_ESQUIVA && MODO != PRUEBA_DEMO && MODO != PRUEBA_GIRO);
+const bool LEER_IR = (MODO != PRUEBA_ESQUIVA && MODO != PRUEBA_DEMO && MODO != PRUEBA_GIRO &&
+                      MODO != PRUEBA_MECANISMO);
 
-// Actuadores: desactivados hasta integrar esa parte (pines pendientes).
-// Mientras estén en false, el elevador y la descarga se simulan por Serial.
-const bool HABILITAR_SERVO    = false;
-const bool HABILITAR_ELEVADOR = false;
-const bool USAR_SERVO    = HABILITAR_SERVO    && (MODO == PRUEBA_REGRESO || MODO == PRUEBA_RUTINA || MODO == COMPETENCIA);
-const bool USAR_ELEVADOR = HABILITAR_ELEVADOR && (MODO == PRUEBA_BARRIDO || MODO == PRUEBA_RUTINA || MODO == COMPETENCIA);
+// Actuadores. Con HABILITAR_* = false se simulan por Serial (útil si un
+// mecanismo no está montado). En los modos que no los usan no se activan.
+const bool HABILITAR_SERVOS   = true;
+const bool HABILITAR_ELEVADOR = true;
+const bool MODO_CON_MECANISMO = (MODO == PRUEBA_MECANISMO || MODO == PRUEBA_CAPTURA ||
+                                 MODO == PRUEBA_RECOLECCION || MODO == PRUEBA_RUTINA ||
+                                 MODO == COMPETENCIA);
+const bool USAR_SERVO    = HABILITAR_SERVOS   && (MODO_CON_MECANISMO || MODO == PRUEBA_REGRESO);
+const bool USAR_ELEVADOR = HABILITAR_ELEVADOR && MODO_CON_MECANISMO;
+// Recolectar en el barrido (en PRUEBA_BARRIDO solo se navega)
+const bool RECOLECTAR    = (MODO == PRUEBA_RECOLECCION || MODO == PRUEBA_RUTINA || MODO == COMPETENCIA);
+
+// Decisión de captura en cada pelota
+enum ModoDecision { DECISION_TODAS, DECISION_SERIAL, DECISION_CAMARA };
+const ModoDecision MODO_DECISION = DECISION_TODAS;
 
 EstadoFSM estadoActual  = FIN_MISION;
 EstadoFSM estadoTrasGiro = NAVEGAR;   // A dónde ir al terminar GIRO_180
@@ -80,11 +99,9 @@ FaseMision fase          = FASE_IDA;
 // ==========================================
 // 3. PINES Y ACTUADORES ADICIONALES
 // ==========================================
-const int pinServoCompuerta  = 25; // Pendiente: choca con el trigger lateral
-Servo servoCompuerta;
-
-const int pinStepElevador    = 14; // MCP PB6 (pendiente: el 28BYJ-48 usa IN1-IN4)
-const int pinDirElevador     = 15; // MCP PB7
+// Servo garra: GPIO 19 | Servo compuerta: GPIO 0   (Recoleccion.ino)
+// Elevador 28BYJ-48: MCP PB4-PB7                   (Elevador.ino)
+// Cámara: RX GPIO 16, TX GPIO 17
 int nivelActualH             = 1;
 
 // ==========================================
@@ -147,7 +164,7 @@ const float TOLERANCIA_CENTRAR_CM            = 3.0f;
 // Si el robot pisa un margen mientras navega, se aleja de él con esta velocidad lateral
 const int V_REPELER_MARGEN                   = 60;
 const int NIVELES_BARRIDO            = 3;
-const int UMBRAL_ARBOL_CM            = 25;   // Solo registro, para la visión futura
+const int UMBRAL_ARBOL_CM            = 25;   // Ultrasonido frontal: a menos de esto hay un árbol
 const unsigned long TIEMPO_LIMITE_RECOLECCION_MS = 150000; // Corta el barrido y regresa
 
 // --- Descarga (AJUSTAR con la geometría real de la cancha) ---
@@ -156,6 +173,32 @@ const float DESPLAZAMIENTO_DESCARGA_CM   = 0.0f; // 0 = ir hasta el margen
 const unsigned long TIMEOUT_POSICIONAR_MS = 8000;
 const float RETROCESO_DESCARGA_CM        = 10.0f;
 const unsigned long TIMEOUT_RETROCESO_MS = 4000;
+
+// --- Recolección (MEDIR en la cancha y ajustar) ---
+const float DISTANCIA_NIVEL_MM     = 150.0f;           // 390 -> 540 -> 690 mm
+const int   PELOTAS_POR_NIVEL[3]   = {5, 6, 5};        // Por árbol (reglamento)
+const float ANCHO_ARBOL_CM         = 30.0f;            // MEDIR: ancho que ve el ultrasonido
+const float ESPACIO_PELOTAS_CM     = 5.0f;             // MEDIR: separación entre pelotas
+const float OFFSET_RAMPA_CM        = 0.0f;             // Rampa respecto al ultrasonido frontal (+ = derecha)
+const float TOLERANCIA_PELOTA_CM   = 0.7f;
+const int   V_REFINO               = 50;               // Velocidad lenta para medir el borde
+const unsigned long TIMEOUT_REFINO_MS = 3000;
+const int   V_PELOTA_MAX           = 80;
+const int   V_PELOTA_MIN           = 40;
+const unsigned long TIMEOUT_PELOTA_IR_MS = 4000;
+const float ACERCAMIENTO_CM        = 6.0f;             // MEDIR con PRUEBA_CAPTURA
+const int   DIST_MIN_CAPTURA_CM    = 3;                // Freno de seguridad por ultrasonido
+const int   V_ACERCAR              = 70;
+const unsigned long TIMEOUT_ACERCAR_MS  = 2500;
+const unsigned long TIMEOUT_RETIRAR_MS  = 2500;
+const float BAJADA_NIVEL3_MM       = 150.0f;           // Probar menos si la pelota no cae lejos
+const int   CAPACIDAD_ALMACEN      = 0;                // 0 = sin límite
+// Decisión
+const unsigned long DECISION_TIMEOUT_MS     = 15000;   // Serial: sin respuesta -> por defecto
+const bool          DECISION_POR_DEFECTO    = true;
+const unsigned long TIEMPO_ESPERA_CAMARA_MS = 1500;    // Cámara: sin pelota centrada -> no
+// PRUEBA_CAPTURA
+const int NIVEL_PRUEBA_CAPTURA = 1;                    // 1, 2 o 3
 
 const unsigned long WATCHDOG_CAMARA = 800;
 
@@ -192,6 +235,12 @@ int direccionBarrido  = 1;   // +1 derecha, -1 izquierda
 int nivelBarrido      = 1;
 bool frenteAArbol     = false;
 int arbolesVistos     = 0;
+int pelotaIdx         = 0;
+int pelotasCapturadas = 0;
+float bordeArbolLat   = 0.0f;   // Odometría lateral del borde del árbol
+float latPerdido      = 0.0f;   // ARBOL_REFINAR: donde se dejó de ver el árbol
+int   faseRefino      = 0;
+int decisionSerial    = -1;     // -1 = sin respuesta, 0 = no, 1 = sí
 
 // Odometría (en pulsos, marco del robot)
 long encPrev[4]          = {0, 0, 0, 0};
@@ -233,6 +282,20 @@ bool detectoMargenDerecho();
 float calcularErrorLinea();
 int irFrontalIzq();
 int irFrontalDer();
+
+void setupElevador();
+void elevadorIrAMM(float objetivoMM);
+float posicionElevadorMM();
+void fijarCeroElevador();
+void apagarBobinasElevador();
+extern unsigned long retardoPasoUs;
+
+void setupRecoleccion();
+void garraA(int angulo);
+void compuertaA(int angulo);
+void capturaEstandar();
+void capturaNivel3Bajar(float bajadaMM);
+void descargarCompuerta();
 
 void setupUltrasonidos();
 void actualizarLecturasUltrasonido();
@@ -322,7 +385,12 @@ const char* nombreEstado(EstadoFSM e) {
     case HOMING_MARGEN:        return "HOMING_MARGEN";
     case BARRIDO:              return "BARRIDO";
     case CENTRAR_FILA:         return "CENTRAR_FILA";
-    case ALINEAR_Y_CAPTURAR:   return "ALINEAR_Y_CAPTURAR";
+    case ARBOL_REFINAR:        return "ARBOL_REFINAR";
+    case PELOTA_IR:            return "PELOTA_IR";
+    case PELOTA_DECIDIR:       return "PELOTA_DECIDIR";
+    case PELOTA_ACERCAR:       return "PELOTA_ACERCAR";
+    case PELOTA_CAPTURAR:      return "PELOTA_CAPTURAR";
+    case PELOTA_RETIRAR:       return "PELOTA_RETIRAR";
     case GIRO_180:             return "GIRO_180";
     case POSICIONAR_DESCARGA:  return "POSICIONAR_DESCARGA";
     case RETROCEDER_DESCARGA:  return "RETROCEDER_DESCARGA";
@@ -343,6 +411,9 @@ EstadoFSM estadoInicial() {
     case PRUEBA_IDA:      return NAVEGAR;
     case PRUEBA_BARRIDO:  return ESCUADRAR;
     case PRUEBA_REGRESO:  return GIRO_180;
+    case PRUEBA_MECANISMO:   return FIN_MISION;   // Quieto, comandos por Serial
+    case PRUEBA_CAPTURA:     return PELOTA_DECIDIR;
+    case PRUEBA_RECOLECCION: return ESCUADRAR;
     case PRUEBA_RUTINA:   return NAVEGAR;
     case COMPETENCIA:     return NAVEGAR;
   }
@@ -351,6 +422,11 @@ EstadoFSM estadoInicial() {
 
 bool esEstadoDeNavegacion(EstadoFSM e) {
   return (e == NAVEGAR || e == ESQUIVAR_PISCINA || e == VERIFICAR_LIBERACION);
+}
+
+bool esEstadoDePelota(EstadoFSM e) {
+  return (e == ARBOL_REFINAR || e == PELOTA_IR || e == PELOTA_DECIDIR || e == PELOTA_ACERCAR ||
+          e == PELOTA_CAPTURAR || e == PELOTA_RETIRAR);
 }
 
 bool estadoPermitido(EstadoFSM e) {
@@ -366,6 +442,11 @@ bool estadoPermitido(EstadoFSM e) {
     case PRUEBA_REGRESO:  return esEstadoDeNavegacion(e) || e == GIRO_180 || e == ESCUADRAR ||
                                  e == POSICIONAR_DESCARGA || e == RETROCEDER_DESCARGA ||
                                  e == DESCARGA_PAYLOAD;
+    case PRUEBA_MECANISMO: return false;
+    case PRUEBA_CAPTURA:   return esEstadoDePelota(e);
+    case PRUEBA_RECOLECCION:
+      return (e == ESCUADRAR || e == HOMING_MARGEN || e == BARRIDO || e == CENTRAR_FILA ||
+              esEstadoDePelota(e));
     case PRUEBA_RUTINA:
     case COMPETENCIA:     return true;
   }
@@ -411,45 +492,88 @@ void alDetectarLinea() {
 // ==========================================
 // 9. ACTUADORES SECUNDARIOS
 // ==========================================
+float alturaNivelMM(int nivel) {
+  return (nivel - 1) * DISTANCIA_NIVEL_MM;
+}
+
 void moverElevadorANivel(int nivel) {
   pararMotores();
+  nivelActualH = nivel;
   if (!USAR_ELEVADOR) {
     Serial.printf("[ELEVADOR] Nivel %d (simulado)\n", nivel);
-    nivelActualH = nivel;
     return;
   }
-  if (nivel == nivelActualH) return;
-
-  mcp.digitalWrite(pinDirElevador, (nivel > nivelActualH) ? HIGH : LOW);
-  int pasos = abs(nivel - nivelActualH) * 400; // TODO: calcular con el piñón real
-
-  for (int i = 0; i < pasos; i++) {
-    mcp.digitalWrite(pinStepElevador, HIGH);
-    delayMicroseconds(800);
-    mcp.digitalWrite(pinStepElevador, LOW);
-    delayMicroseconds(800);
-  }
-  nivelActualH = nivel;
-
-  while (Serial2.available() > 0) Serial2.read();
+  Serial.printf("[ELEVADOR] Moviendo a nivel %d (%.0f mm)...\n", nivel, alturaNivelMM(nivel));
+  elevadorIrAMM(alturaNivelMM(nivel));
+  while (Serial2.available() > 0) Serial2.read();   // Descarta tramas viejas de la cámara
   ultimaLecturaCamara = millis();
 }
 
 void abrirCompuertaDescarga() {
   if (!USAR_SERVO) {
-    Serial.println("[DESCARGA] Compuerta abierta 2 s (simulado)");
+    Serial.println("[DESCARGA] Compuerta abierta 2.5 s (simulado)");
     delay(500);
     return;
   }
-  servoCompuerta.write(90);
-  delay(2000);
-  servoCompuerta.write(0);
+  descargarCompuerta();
   while (Serial2.available() > 0) Serial2.read();
 }
 
-void ejecutarMecanismoRecolector() {
-  delay(250);
+// Secuencia de captura según el nivel (bloqueante, robot detenido)
+void ejecutarCaptura(int nivel) {
+  if (!USAR_SERVO) {
+    Serial.printf("[CAPTURA] Nivel %d (simulado)\n", nivel);
+    delay(nivel < 3 ? 1500 : 3000);
+    return;
+  }
+  if (nivel < 3) {
+    capturaEstandar();
+  } else {
+    if (USAR_ELEVADOR) capturaNivel3Bajar(BAJADA_NIVEL3_MM);
+    else               capturaEstandar();
+  }
   while (Serial2.available() > 0) Serial2.read();
+}
+
+// ---------- Control de la recolección ----------
+bool recoleccionSinTiempo() {
+  return (MODO != PRUEBA_CAPTURA) &&
+         (millis() - tiempoInicioMision > TIEMPO_LIMITE_RECOLECCION_MS);
+}
+
+// Corta la recolección: baja el elevador y va a regresar
+void terminarRecoleccion(const char* motivo) {
+  Serial.printf("-> %s. Centrando en la fila antes de regresar.\n", motivo);
+  fase = FASE_VUELTA;
+  moverElevadorANivel(1);
+  cambiarEstado(CENTRAR_FILA, true);
+}
+
+// Prepara un nivel del barrido (se llama al terminar el homing y al cambiar de nivel)
+void iniciarNivelBarrido() {
+  contadorMargen = 0;
+  frenteAArbol = false;
+  Serial.printf("-> Barrido nivel %d hacia la %s\n", nivelBarrido,
+                (direccionBarrido > 0) ? "derecha" : "izquierda");
+}
+
+// Pasa a la siguiente pelota del árbol, o vuelve al barrido si ya terminó
+void siguientePelota() {
+  pelotaIdx++;
+  if (CAPACIDAD_ALMACEN > 0 && pelotasCapturadas >= CAPACIDAD_ALMACEN) {
+    terminarRecoleccion("Almacén lleno");
+    return;
+  }
+  if (recoleccionSinTiempo()) {
+    terminarRecoleccion("Tiempo límite de recolección");
+    return;
+  }
+  if (pelotaIdx < PELOTAS_POR_NIVEL[nivelBarrido - 1]) {
+    cambiarEstado(PELOTA_IR, true);
+  } else {
+    Serial.printf("   Árbol terminado en el nivel %d\n", nivelBarrido);
+    cambiarEstado(BARRIDO, true);   // frenteAArbol sigue en true: no se repite este árbol
+  }
 }
 
 // ==========================================
@@ -514,29 +638,82 @@ void imprimirMonitor(int distFrontal, int distLateral, bool lineaCruda,
                      bool margenIzq, bool margenDer) {
   if (millis() - ultimoMonitor < 300) return;
   ultimoMonitor = millis();
-  Serial.printf("[MON] %-20s %s N%d | linea=%d mIzq=%d mDer=%d | US F=%3d L=%3d | rumbo=%+6.1f° av=%+6.1fcm lat=%+6.1fcm\n",
+  Serial.printf("[MON] %-20s %s N%d | linea=%d mIzq=%d mDer=%d | US F=%3d L=%3d | rumbo=%+6.1f° av=%+6.1fcm lat=%+6.1fcm | elev=%3.0fmm cap=%d\n",
                 nombreEstado(estadoActual), (fase == FASE_IDA) ? "IDA  " : "VUELTA",
                 nivelBarrido, lineaCruda ? 1 : 0, margenIzq ? 1 : 0, margenDer ? 1 : 0,
                 distFrontal, distLateral, rumboGrados(),
-                pulsosACm(odoAvance), pulsosACm(odoLateral));
+                pulsosACm(odoAvance), pulsosACm(odoLateral),
+                posicionElevadorMM(), pelotasCapturadas);
 }
 
-// PRUEBA_GIRO:
-//   'g' = girar 180°      'a' = avanzar recto PULSOS_CALIBRACION_AVANCE
-//   '+'/'-' = +/-100 pulsos de giro    '>'/'<' = +/-20 pulsos de giro
+void imprimirMenuMecanismo() {
+  Serial.println("--- PRUEBA MECANISMO (robot quieto) ---");
+  Serial.println(" '1' '2' '3' = elevador a nivel | 'u' +10 mm | 'j' -10 mm | 'z' fijar cero aquí");
+  Serial.println(" 'f' elevador más rápido | 'l' más lento");
+  Serial.println(" 'c' captura estándar | 'e' captura nivel 3 (baja, suelta y vuelve a subir)");
+  Serial.println(" 'a' abrir y cerrar compuerta");
+}
+
+void comandoMecanismo(char c) {
+  bool movio = true;
+  if (c == '1' || c == '2' || c == '3') {
+    moverElevadorANivel(c - '0');
+  } else if (c == 'u' || c == 'j') {
+    if (USAR_ELEVADOR) elevadorIrAMM(posicionElevadorMM() + ((c == 'u') ? 10.0f : -10.0f));
+  } else if (c == 'z') {
+    fijarCeroElevador();
+    Serial.println(">>> Posición actual fijada como 0 mm (nivel 1)");
+  } else if (c == 'f') {
+    retardoPasoUs = max(600UL, retardoPasoUs - 100);
+  } else if (c == 'l') {
+    retardoPasoUs += 100;
+  } else if (c == 'c') {
+    ejecutarCaptura(1);
+  } else if (c == 'e') {
+    float altura = posicionElevadorMM();
+    ejecutarCaptura(3);
+    if (USAR_ELEVADOR) elevadorIrAMM(altura);
+  } else if (c == 'a') {
+    abrirCompuertaDescarga();
+  } else {
+    movio = false;
+  }
+  if (movio) Serial.printf(">>> Elevador: %.1f mm | retardo de paso: %lu us\n",
+                           posicionElevadorMM(), retardoPasoUs);
+}
+
+// Comandos por Serial según el modo:
+//  PRUEBA_GIRO:      'g' giro 180°, 'a' avance recto, '+'/'-' y '>'/'<' ajustan el giro
+//  PRUEBA_MECANISMO: ver imprimirMenuMecanismo()
+//  PRUEBA_CAPTURA:   'r' repetir la captura
+//  DECISION_SERIAL:  's' capturar / 'n' omitir la pelota actual
 void procesarComandosSerial() {
   while (Serial.available() > 0) {
     char c = Serial.read();
-    long antes = pulsosGiro180;
-    if (c == '+') pulsosGiro180 += 100;
-    if (c == '-') pulsosGiro180 = max(100L, pulsosGiro180 - 100);
-    if (c == '>') pulsosGiro180 += 20;
-    if (c == '<') pulsosGiro180 = max(100L, pulsosGiro180 - 20);
-    if (pulsosGiro180 != antes) Serial.printf(">>> pulsosGiro180 = %ld\n", pulsosGiro180);
 
-    if (MODO == PRUEBA_GIRO && estadoActual == FIN_MISION) {
-      if (c == 'g') iniciarGiro180(FIN_MISION);
-      if (c == 'a') cambiarEstado(CALIB_AVANCE, true);
+    if (MODO == PRUEBA_GIRO) {
+      long antes = pulsosGiro180;
+      if (c == '+') pulsosGiro180 += 100;
+      if (c == '-') pulsosGiro180 = max(100L, pulsosGiro180 - 100);
+      if (c == '>') pulsosGiro180 += 20;
+      if (c == '<') pulsosGiro180 = max(100L, pulsosGiro180 - 20);
+      if (pulsosGiro180 != antes) Serial.printf(">>> pulsosGiro180 = %ld\n", pulsosGiro180);
+      if (estadoActual == FIN_MISION) {
+        if (c == 'g') iniciarGiro180(FIN_MISION);
+        if (c == 'a') cambiarEstado(CALIB_AVANCE, true);
+      }
+    }
+
+    if (MODO == PRUEBA_MECANISMO) comandoMecanismo(c);
+
+    if (MODO == PRUEBA_CAPTURA && estadoActual == FIN_MISION && c == 'r') {
+      pelotaIdx = 0;
+      cambiarEstado(PELOTA_DECIDIR, true);
+    }
+
+    if (estadoActual == PELOTA_DECIDIR && MODO_DECISION == DECISION_SERIAL) {
+      if (c == 's') decisionSerial = 1;
+      if (c == 'n') decisionSerial = 0;
     }
   }
 }
@@ -558,9 +735,10 @@ void autocalibrarTrack() {
 // ==========================================
 void setup() {
   Serial.begin(115200);
-  Serial2.begin(115200, SERIAL_8N1, 16, 19);
+  Serial2.begin(115200, SERIAL_8N1, 16, 17);   // Cámara: RX 16, TX 17
 
   Wire.begin(21, 22);
+  Wire.setClock(400000);   // I2C rápido (probado por el equipo): motores y elevador
   if (!mcp.begin_I2C()) {
     Serial.println("Error al iniciar MCP23017");
     while (1);
@@ -573,15 +751,10 @@ void setup() {
 
   if (LEER_IR) setupInfrarrojos();
 
-  if (USAR_ELEVADOR) {
-    mcp.pinMode(pinStepElevador, OUTPUT);
-    mcp.pinMode(pinDirElevador, OUTPUT);
-  }
-
-  if (USAR_SERVO) {
-    servoCompuerta.attach(pinServoCompuerta);
-    servoCompuerta.write(0);
-  }
+  // El elevador siempre se configura para dejar sus bobinas apagadas.
+  // Al encender, el elevador debe estar ABAJO (nivel 1): esa es la posición 0.
+  setupElevador();
+  if (USAR_SERVO) setupRecoleccion();
 
   if (MODO == PRUEBA_DEMO) {
     mcp.pinMode(pinTrackLinea, INPUT_PULLUP);
@@ -602,11 +775,21 @@ void setup() {
     Serial.println("'g' = giro 180 | '+'/'-' = +/-100 pulsos | '>'/'<' = +/-20 pulsos");
     Serial.println("'a' = avance recto para calibrar pulsos por cm");
     Serial.printf("pulsosGiro180 actual = %ld\n", pulsosGiro180);
+  } else if (MODO == PRUEBA_MECANISMO) {
+    estadoActual = FIN_MISION;
+    imprimirMenuMecanismo();
+    Serial.println("El elevador debe estar ABAJO al encender (0 mm = nivel 1).");
   } else if (MODO == PRUEBA_SENSORES) {
     estadoActual = FIN_MISION;
     Serial.println("--- MODO SENSORES: robot quieto, diagnóstico cada 200 ms ---");
     Serial.println("Esperado: 1 = negro, 0 = blanco. Ultrasonidos en cm (999 = sin eco).");
   } else {
+    // PRUEBA_CAPTURA: el robot está frente a una pelota en el nivel elegido
+    if (MODO == PRUEBA_CAPTURA) {
+      nivelBarrido = NIVEL_PRUEBA_CAPTURA;
+      moverElevadorANivel(NIVEL_PRUEBA_CAPTURA);
+      Serial.println("--- PRUEBA CAPTURA: al terminar envía 'r' para repetir ---");
+    }
     // Sin botón: arranca sola después de encender el interruptor de control
     Serial.printf("--- Arranque en %lu ms ---\n", RETARDO_ARRANQUE_MS);
     delay(RETARDO_ARRANQUE_MS);
@@ -814,6 +997,7 @@ void loop() {
         direccionBarrido = 1;
         Serial.printf("-> Homing %s. Origen lateral fijado.\n", listo ? "OK" : "por TIMEOUT");
         moverElevadorANivel(1);
+        iniciarNivelBarrido();
         cambiarEstado(BARRIDO, true);
         break;
       }
@@ -826,29 +1010,30 @@ void loop() {
       if (!estadoIniciado) {
         estadoIniciado = true;
         contadorMargen = 0;
-        frenteAArbol = false;
-        Serial.printf("-> Barrido nivel %d hacia la %s\n", nivelBarrido,
-                      (direccionBarrido > 0) ? "derecha" : "izquierda");
       }
 
       // Límite de tiempo de la ronda: cortar y regresar
-      if (millis() - tiempoInicioMision > TIEMPO_LIMITE_RECOLECCION_MS) {
-        Serial.println("-> Tiempo límite de recolección. Regresando.");
-        fase = FASE_VUELTA;
-        moverElevadorANivel(1);
-        iniciarGiro180(NAVEGAR);
+      if (recoleccionSinTiempo()) {
+        terminarRecoleccion("Tiempo límite de recolección");
         break;
       }
 
-      // Registro de árboles (aquí se integrará la visión: parar y capturar)
+      // Borde de un árbol: empieza la recolección de sus pelotas en este nivel
       bool arbolAhora = (distFrontal >= 3 && distFrontal < UMBRAL_ARBOL_CM);
       if (arbolAhora && !frenteAArbol) {
+        frenteAArbol = true;
         arbolesVistos++;
         Serial.printf("   [ÁRBOL] Inicio frente a árbol (F=%d cm, lat=%.1f cm)\n",
                       distFrontal, pulsosACm(odoLateral - refLateral));
+        if (RECOLECTAR) {
+          cambiarEstado(ARBOL_REFINAR, true);
+          break;
+        }
       }
-      if (!arbolAhora && frenteAArbol) Serial.println("   [ÁRBOL] Fin del árbol");
-      frenteAArbol = arbolAhora;
+      if (!arbolAhora && frenteAArbol) {
+        frenteAArbol = false;
+        Serial.println("   [ÁRBOL] Fin del árbol");
+      }
 
       bool margenAlFrente = (direccionBarrido > 0) ? margenDer : margenIzq;
       contadorMargen = margenAlFrente ? contadorMargen + 1 : 0;
@@ -865,6 +1050,7 @@ void loop() {
           nivelBarrido++;
           direccionBarrido = -direccionBarrido;
           moverElevadorANivel(nivelBarrido);
+          iniciarNivelBarrido();
           estadoIniciado = false;          // Reinicia el nivel dentro del mismo estado
           tiempoInicioEstado = millis();
         } else {
@@ -900,10 +1086,150 @@ void loop() {
       break;
     }
 
-    // ---------- VISIÓN (reservado) ----------
-    case ALINEAR_Y_CAPTURAR:
-      cambiarEstado(BARRIDO, true);
+    // ---------- RECOLECCIÓN: BORDE PRECISO DEL ÁRBOL ----------
+    // El ultrasonido se actualiza cada ~70 ms: a velocidad de barrido el borde
+    // se detecta tarde. Se retrocede despacio hasta perder el árbol y se vuelve
+    // hasta verlo otra vez; el promedio de ambos puntos cancela ese retraso.
+    case ARBOL_REFINAR: {
+      if (!estadoIniciado) {
+        estadoIniciado = true;
+        faseRefino = 0;
+      }
+      bool arbolVisto = (distFrontal >= 3 && distFrontal < UMBRAL_ARBOL_CM);
+
+      if (millis() - tiempoInicioEstado > TIMEOUT_REFINO_MS) {
+        bordeArbolLat = odoLateral;            // Respaldo: usar la posición actual
+        pelotaIdx = 0;
+        Serial.println("   [ÁRBOL] Refinado por TIMEOUT: se usa la posición actual");
+        cambiarEstado(PELOTA_IR, true);
+        break;
+      }
+      if (faseRefino == 0) {
+        if (!arbolVisto) { latPerdido = odoLateral; faseRefino = 1; }
+        else moverOmni(-direccionBarrido * V_REFINO, correccionAvance(), wRumbo);
+      }
+      if (faseRefino == 1) {
+        if (arbolVisto) {
+          bordeArbolLat = (latPerdido + odoLateral) / 2.0f;
+          pelotaIdx = 0;
+          cambiarEstado(PELOTA_IR, true);
+          break;
+        }
+        moverOmni(direccionBarrido * V_REFINO, correccionAvance(), wRumbo);
+      }
       break;
+    }
+
+    // ---------- RECOLECCIÓN: PELOTA A PELOTA ----------
+    // Posición de la pelota i en el árbol: desde el borde detectado, centradas
+    // en ANCHO_ARBOL_CM y separadas ESPACIO_PELOTAS_CM, en el sentido del barrido.
+    case PELOTA_IR: {
+      if (recoleccionSinTiempo()) {
+        terminarRecoleccion("Tiempo límite de recolección");
+        break;
+      }
+      int k = PELOTAS_POR_NIVEL[nivelBarrido - 1];
+      float offsetPrimeraCm = (ANCHO_ARBOL_CM - (k - 1) * ESPACIO_PELOTAS_CM) / 2.0f;
+      float posCm = offsetPrimeraCm + pelotaIdx * ESPACIO_PELOTAS_CM;
+      float objetivo = bordeArbolLat + cmAPulsos(direccionBarrido * posCm - OFFSET_RAMPA_CM);
+      float faltaCm = pulsosACm(objetivo - odoLateral);
+
+      if (fabs(faltaCm) <= TOLERANCIA_PELOTA_CM ||
+          millis() - tiempoInicioEstado > TIMEOUT_PELOTA_IR_MS) {
+        cambiarEstado(PELOTA_DECIDIR, true);
+        break;
+      }
+      int vx = (int)constrain(faltaCm * 8.0f, (float)-V_PELOTA_MAX, (float)V_PELOTA_MAX);
+      if (abs(vx) < V_PELOTA_MIN) vx = (faltaCm > 0) ? V_PELOTA_MIN : -V_PELOTA_MIN;
+      moverOmni(vx, correccionAvance(), wRumbo);
+      break;
+    }
+
+    case PELOTA_DECIDIR: {
+      int k = PELOTAS_POR_NIVEL[nivelBarrido - 1];
+      if (!estadoIniciado) {
+        estadoIniciado = true;
+        pararMotores();
+        decisionSerial = -1;
+        if (MODO_DECISION == DECISION_SERIAL) {
+          Serial.printf("?? Nivel %d, pelota %d de %d: ¿capturar? (s/n)\n",
+                        nivelBarrido, pelotaIdx + 1, k);
+        }
+      }
+
+      int decision = -1;   // -1 = aún esperando
+      switch (MODO_DECISION) {
+        case DECISION_TODAS:
+          decision = 1;
+          break;
+        case DECISION_SERIAL:
+          if (decisionSerial >= 0) decision = decisionSerial;
+          else if (millis() - tiempoInicioEstado > DECISION_TIMEOUT_MS) {
+            decision = DECISION_POR_DEFECTO ? 1 : 0;
+            Serial.println("   Sin respuesta: se usa la decisión por defecto");
+          }
+          break;
+        case DECISION_CAMARA:
+          // Provisional: se ajusta cuando se defina el protocolo de la cámara
+          if (pelotaCentrada) decision = 1;
+          else if (millis() - tiempoInicioEstado > TIEMPO_ESPERA_CAMARA_MS) decision = 0;
+          break;
+      }
+      if (decision < 0) break;
+
+      if (decision == 1) {
+        cambiarEstado(PELOTA_ACERCAR, true);
+      } else {
+        Serial.printf("   Pelota %d del nivel %d omitida\n", pelotaIdx + 1, nivelBarrido);
+        if (MODO == PRUEBA_CAPTURA) cambiarEstado(FIN_MISION, true);
+        else                        siguientePelota();
+      }
+      break;
+    }
+
+    case PELOTA_ACERCAR: {
+      if (!estadoIniciado) {
+        estadoIniciado = true;
+        refAvance = odoAvance;
+      }
+      float avanzadoCm = pulsosACm(odoAvance - refAvance);
+      bool muyCerca = (distFrontal >= 2 && distFrontal <= DIST_MIN_CAPTURA_CM);
+      if (avanzadoCm >= ACERCAMIENTO_CM || muyCerca ||
+          millis() - tiempoInicioEstado > TIMEOUT_ACERCAR_MS) {
+        cambiarEstado(PELOTA_CAPTURAR, true);
+        break;
+      }
+      moverOmni(0, V_ACERCAR, wRumbo);
+      break;
+    }
+
+    case PELOTA_CAPTURAR:
+      pararMotores();
+      Serial.printf("-> Capturando pelota %d del nivel %d\n", pelotaIdx + 1, nivelBarrido);
+      ejecutarCaptura(nivelBarrido);
+      pelotasCapturadas++;
+      cambiarEstado(PELOTA_RETIRAR, true);
+      break;
+
+    case PELOTA_RETIRAR: {
+      // Vuelve hasta la distancia de trabajo fijada en la línea (avanceObjetivo)
+      float faltaCm = pulsosACm(avanceObjetivo - odoAvance);   // negativo = falta retroceder
+      if (faltaCm >= -0.5f || millis() - tiempoInicioEstado > TIMEOUT_RETIRAR_MS) {
+        pararMotores();
+        if (nivelBarrido == 3 && USAR_ELEVADOR) {
+          elevadorIrAMM(alturaNivelMM(3));   // Nivel 3: vuelve a subir tras soltar la pelota
+        }
+        if (MODO == PRUEBA_CAPTURA) {
+          Serial.println("-> Captura terminada. Envía 'r' para repetir.");
+          cambiarEstado(FIN_MISION, true);
+        } else {
+          siguientePelota();
+        }
+        break;
+      }
+      moverOmni(0, -V_ACERCAR, wRumbo);
+      break;
+    }
 
     // ---------- GIRO 180° CONTROLADO ----------
     case GIRO_180: {
@@ -986,8 +1312,8 @@ void loop() {
     case DESCARGA_PAYLOAD:
       pararMotores();
       abrirCompuertaDescarga();
-      Serial.printf("-> Rutina completa en %.1f s. Árboles registrados: %d\n",
-                    (millis() - tiempoInicioMision) / 1000.0f, arbolesVistos);
+      Serial.printf("-> Rutina completa en %.1f s. Pelotas capturadas: %d\n",
+                    (millis() - tiempoInicioMision) / 1000.0f, pelotasCapturadas);
       cambiarEstado(FIN_MISION, true);
       break;
 
