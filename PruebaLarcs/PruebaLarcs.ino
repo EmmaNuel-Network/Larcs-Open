@@ -152,6 +152,8 @@ void actualizarLecturasUltrasonido();
 int leerUltrasonidoAlto();
 int leerUltrasonidoLateral();
 float calcularErrorLinea();
+int irFrontalIzq();
+int irFrontalDer();
 int obtenerCorreccionParedPD(int distMedida);
 
 // ==========================================
@@ -310,12 +312,9 @@ void procesarCamaraVision() {
 // ==========================================
 // 9b. DIAGNÓSTICO DE SENSORES (solo PRUEBA_SENSORES)
 // ==========================================
-// Lee el puerto B del MCP completo en una sola transacción I2C.
-// Mapeo según Infrarojos.ino:
-//   PB0 = frontal centro, PB1 = frontal izq, PB2 = frontal der,
-//   PB3 = lateral izq
-//   Lateral der: GPIO directo de la ESP32 (PB4 ahora es del paso a paso)
-// Se espera: 1 = negro, 0 = blanco.
+// Mapeo (Infrarojos.ino): PB0 = frontal der, PB1 = frontal izq,
+//                         PB2 = lateral izq, PB3 = lateral der
+// Muestra el valor CRUDO de cada pin y la interpretación del módulo (1 = negro).
 const unsigned long INTERVALO_DIAGNOSTICO_MS = 200;
 unsigned long ultimoDiagnostico = 0;
 
@@ -324,20 +323,21 @@ void imprimirDiagnosticoSensores(int distFrontal, int distLateral) {
   ultimoDiagnostico = millis();
 
   uint8_t puertoB = mcp.readGPIOB();
-  int fCen = (puertoB >> 0) & 1;
-  int fIzq = (puertoB >> 1) & 1;
-  int fDer = (puertoB >> 2) & 1;
-  int lIzq = (puertoB >> 3) & 1;
-  int lDer = detectoMargenDerecho() ? 1 : 0; // GPIO de la ESP32
+  int rawPB0 = (puertoB >> 0) & 1;
+  int rawPB1 = (puertoB >> 1) & 1;
+  int rawPB2 = (puertoB >> 2) & 1;
+  int rawPB3 = (puertoB >> 3) & 1;
 
-  float posLinea = calcularErrorLinea(); // -1 izq, 0 centro, +1 der, 999 sin línea
+  float posLinea = calcularErrorLinea(); // -1 izq, 0 ambos, +1 der, 999 sin línea
 
-  Serial.printf("IR frontal [izq cen der] = %d %d %d  pos=", fIzq, fCen, fDer);
+  Serial.printf("CRUDO FrIzq(PB1)=%d FrDer(PB0)=%d LatIzq(PB2)=%d LatDer(PB3)=%d",
+                rawPB1, rawPB0, rawPB2, rawPB3);
+  Serial.printf("  | NEGRO? fr=%d %d lat=%d %d pos=",
+                irFrontalIzq(), irFrontalDer(),
+                detectoMargenIzquierdo() ? 1 : 0, detectoMargenDerecho() ? 1 : 0);
   if (posLinea >= 999.0f) Serial.print(" ---");
   else                    Serial.printf("%+.2f", posLinea);
-  Serial.printf("  | lateral izq=%d der=%d", lIzq, lDer);
-  Serial.printf("  | US frontal(T18/E23)=%3d lateral(T32/E26)=%3d\n",
-                distFrontal, distLateral);
+  Serial.printf("  | US F=%3d L=%3d\n", distFrontal, distLateral);
 }
 
 // ==========================================

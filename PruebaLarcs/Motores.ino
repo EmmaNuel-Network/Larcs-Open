@@ -30,7 +30,8 @@ const int pinM4_PWM = 27; // ENB (GPIO 27)
 const int pinEncM1A = 34; const int pinEncM1B = 2;   // Delantero Izq
 const int pinEncM2A = 35; const int pinEncM2B = 5;   // Delantero Der
 const int pinEncM3A = 4;  const int pinEncM3B = 15;  // Trasero Izq
-const int pinEncM4A = 17; const int pinEncM4B = 33;  // Trasero Der
+const int pinEncM4A = 32
+; const int pinEncM4B = 33;  // Trasero Der
 
 // 3. VARIABLES GLOBALES Y SECCIÓN CRÍTICA
 volatile long pulsosM1 = 0;

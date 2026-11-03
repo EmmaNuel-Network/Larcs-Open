@@ -7,7 +7,7 @@
 const int pinTrigAlto        = 18; // Trigger Sensor Alto
 const int pinEchoAlto        = 23; // Echo Sensor Alto
 
-const int pinTrigLateral     = 32; // Trigger Sensor Lateral
+const int pinTrigLateral     = 25; // Trigger Sensor Lateral
 const int pinEchoLateral     = 26; // Echo Sensor Lateral
 
 // 2. CONFIGURACIÓN Y CONSTANTES DE DISTANCIA
