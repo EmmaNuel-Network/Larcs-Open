@@ -70,7 +70,7 @@ enum ModoPrueba {
 };
 
 // >>>>>>>>>> CAMBIAR AQUÍ EL MODO Y VOLVER A SUBIR <<<<<<<<<<
-const ModoPrueba MODO = PRUEBA_GIRO;
+const ModoPrueba MODO = PRUEBA_DEMO;
 
 // Subsistemas según el modo
 const bool LEER_IR = (MODO != PRUEBA_ESQUIVA && MODO != PRUEBA_DEMO && MODO != PRUEBA_GIRO &&
@@ -78,15 +78,15 @@ const bool LEER_IR = (MODO != PRUEBA_ESQUIVA && MODO != PRUEBA_DEMO && MODO != P
 
 // Actuadores. Con HABILITAR_* = false se simulan por Serial (útil si un
 // mecanismo no está montado). En los modos que no los usan no se activan.
-const bool HABILITAR_SERVOS   = true;
-const bool HABILITAR_ELEVADOR = true;
+const bool HABILITAR_SERVOS   = false;
+const bool HABILITAR_ELEVADOR = false;
 const bool MODO_CON_MECANISMO = (MODO == PRUEBA_MECANISMO || MODO == PRUEBA_CAPTURA ||
                                  MODO == PRUEBA_RECOLECCION || MODO == PRUEBA_RUTINA ||
                                  MODO == COMPETENCIA);
 const bool USAR_SERVO    = HABILITAR_SERVOS   && (MODO_CON_MECANISMO || MODO == PRUEBA_REGRESO);
 const bool USAR_ELEVADOR = HABILITAR_ELEVADOR && MODO_CON_MECANISMO;
 // Recolectar en el barrido (en PRUEBA_BARRIDO solo se navega)
-const bool RECOLECTAR    = (MODO == PRUEBA_RECOLECCION || MODO == PRUEBA_RUTINA || MODO == COMPETENCIA);
+const bool RECOLECTAR    = false;//(MODO == PRUEBA_RECOLECCION || MODO == PRUEBA_RUTINA || MODO == COMPETENCIA);
 
 // Decisión de captura en cada pelota
 enum ModoDecision { DECISION_TODAS, DECISION_SERIAL, DECISION_CAMARA };
