@@ -61,7 +61,7 @@ while cap.isOpened():
 
     if k_size % 2 == 0:
         k_size += 1
-    k_size = max(1, k_size)
+    k_size = max(1, k _size)
 
     hsv = cv.cvtColor(frame, cv.COLOR_BGR2HSV)
 
