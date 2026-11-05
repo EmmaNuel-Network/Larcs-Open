@@ -1,0 +1,66 @@
+================================================================================
+ROBOT RECOLECTOR DE CAFÉ - LARC OPEN 2025
+GUÍA RÁPIDA DE CALIBRACIÓN, VISIÓN Y CONTROL ESP32
+================================================================================
+
+CONTENIDO DEL PAQUETE:
+----------------------
+1. SISTEMA DE VISIÓN (Raspberry Pi 4 / Cámara USB):
+   - calibrar_vision.py : Calibrador interactivo HSV a 320x240 (TightVNC).
+   - todo.py            : Visualizador global de prueba de todas las detecciones.
+   - vision_master.py   : Controlador principal de visión para la competencia (640x480).
+   - cone_UART.py       : Manejador serial UART asíncrono con ESP32.
+   - vision_general2.py : Algoritmos de filtrado, morfología y detección.
+   - parametros.py      : Lector automático de variables desde .env.
+   - .env               : Archivo de configuración de rangos HSV y parámetros de cámara.
+
+2. SISTEMA DE CONTROL EMBEBIDO (ESP32 / Arduino IDE):
+   - Robot-Larc.ino     : Máquina de estados principal (FSM), navegación y toma de decisiones.
+   - Motores.ino        : Cinemática omnidireccional, control de velocidad PD y encoders.
+   - Elevador.ino       : Driver de medio paso rápido por MCP23017 para motor 28BYJ-48.
+   - Recoleccion.ino    : Control suave de servo de garra y servo de compuerta trasera.
+   - infrarojos.ino     : Sensores IR de línea frontal y márgenes laterales con filtro de distancia.
+   - Ultrasonidos.ino   : Sensores ultrasonido frontal y lateral con muestreo secuencial anti-ecos.
+
+3. REGLAMENTO OFICIAL:
+   - LARC-OPEN-2025-Robot-Recolector-de-Cafe-Ver-1.0.pdf
+
+--------------------------------------------------------------------------------
+PASO A PASO PARA LA COMPETENCIA:
+--------------------------------------------------------------------------------
+
+FASE 1: CALIBRACIÓN DE VISIÓN (DURANTE LA HORA PREVIA)
+1. Conectarse a la Raspberry Pi por SSH y abrir TightVNC Viewer.
+2. Ejecutar:
+      python3 calibrar_vision.py
+3. Colocar cada pelota frente a la cámara a la distancia de trabajo (~15-25 cm):
+   - Ajustar los trackbars hasta aislar el color en la máscara.
+   - Verificar que el círculo en "Detección en Vivo" se dibuje en VERDE (cumple esfericidad).
+   - Presionar la tecla 's' para imprimir los rangos en consola.
+4. Repetir para: Amarilla, Naranja, Roja (baja y alta), Azul, Negra y Árbol.
+5. Copiar los valores impresos y pegarlos en el archivo .env.
+
+FASE 2: VALIDACIÓN GLOBAL
+1. Ejecutar:
+      python3 todo.py
+2. Verificar en pantalla que:
+   - Las pelotas Rojas, Naranjas y Amarillas se etiqueten como "MADURA".
+   - Las pelotas Azules y Negras se etiqueten como "SOBREMADURA".
+   - Las pelotas Verdes sean IGNORADAS (para evitar la penalización de -7 pts).
+   - Los contenedores y piscinas se clasifiquen correctamente.
+3. Presionar 'q' para salir.
+
+FASE 3: PUESTA EN MARCHA PARA LA COMPETENCIA
+1. En la Raspberry Pi, ejecutar antes de la ronda:
+      python3 vision_master.py
+
+2. En la ESP32 (Robot-Larc.ino), cambiar las siguientes 5 líneas antes de subir el código:
+   - Línea 73: const ModoPrueba MODO = COMPETENCIA;
+   - Línea 81: const bool HABILITAR_SERVOS = true;
+   - Línea 82: const bool HABILITAR_ELEVADOR = true;
+   - Línea 89: const bool RECOLECTAR = true;
+   - Línea 93: const ModoDecision MODO_DECISION = DECISION_CAMARA;
+
+3. Compilar y subir a la ESP32 desde Arduino IDE.
+4. Colocar el robot en la zona de salida y encender.
+================================================================================

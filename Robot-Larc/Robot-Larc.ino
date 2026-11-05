@@ -1,7 +1,10 @@
 // ==========================================
 // PESTAÑA PRINCIPAL: Robot-Larc.ino
 // FSM única + modos de prueba incrementales
-// Integra la lógica probada de PruebaIntegracionUltrasonidos.ino
+// Navegación completa + recolección: ida con esquiva, escuadrado, homing,
+// barrido de 3 niveles con captura pelota a pelota, regreso y descarga.
+// La decisión de capturar cada pelota se toma en el estado PELOTA_DECIDIR:
+// hoy "todas" o manual por Serial; luego la visión de la ESP32-CAM.
 // ==========================================
 #include <Arduino.h>
 #include <ESP32Servo.h>
@@ -24,75 +27,234 @@ struct ControlPD {
 // 1. ESTADOS DE LA FSM
 // ==========================================
 enum EstadoFSM {
-  ESPERA_INICIO,
-  IR_A_CULTIVO,
-  ESQUIVAR_PISCINA,
-  VERIFICAR_LIBERACION,   // Viene de la prueba funcional
-  HOMING_Y_ESCUADRADO,
-  RECOLECCION_MULTINIVEL,
-  ALINEAR_Y_CAPTURAR,
-  REGRESO_BENEFICIADERO,
+  NAVEGAR,                // Avanza al frente con rumbo fijo (ida o vuelta)
+  ESQUIVAR_PISCINA,       // Lógica probada de PruebaIntegracionUltrasonidos
+  VERIFICAR_LIBERACION,
+  ESCUADRAR,              // Se pone perpendicular a la línea con los 2 IR frontales
+  HOMING_MARGEN,          // Strafe a la izquierda hasta el margen izquierdo
+  BARRIDO,                // Recorre la fila de árboles de margen a margen, 3 niveles
+  CENTRAR_FILA,           // Vuelve al centro de la fila antes de regresar
+  ARBOL_REFINAR,          // Mide el borde del árbol con precisión (ida y vuelta lenta)
+  PELOTA_IR,              // Strafe hasta la posición de la pelota en el árbol
+  PELOTA_DECIDIR,         // ¿Se captura? (todas / Serial / cámara)
+  PELOTA_ACERCAR,         // Avanza hacia el árbol
+  PELOTA_CAPTURAR,        // Secuencia de la garra (y elevador en nivel 3)
+  PELOTA_RETIRAR,         // Vuelve a la distancia de la línea
+  GIRO_180,               // Media vuelta controlada por odometría
+  POSICIONAR_DESCARGA,    // Strafe hasta quedar frente al recipiente
+  RETROCEDER_DESCARGA,    // Acerca la compuerta trasera al recipiente
   DESCARGA_PAYLOAD,
+  CALIB_AVANCE,           // Solo PRUEBA_GIRO: avance recto para calibrar cm
   FIN_MISION,
   ESTADO_ERROR
 };
 
+enum FaseMision { FASE_IDA, FASE_VUELTA };
+
 // ==========================================
 // 2. MODOS DE PRUEBA
 // ==========================================
-// Cada modo define en qué estado arranca y qué estados tiene permitidos.
-// Si la FSM intenta entrar a un estado no permitido, el robot se detiene
-// (FIN_MISION) y lo reporta por Serial.
 enum ModoPrueba {
-  PRUEBA_ESQUIVA,       // Idéntico a PruebaIntegracionUltrasonidos (sin IR)
-  PRUEBA_IR_A_CULTIVO,  // Esquiva + se detiene al ver la línea del cultivo
-  PRUEBA_HOMING,        // Arranca en homing (poner el robot sobre la línea)
-  PRUEBA_RECOLECCION,   // Arranca en recolección (poner el robot frente al árbol)
-  PRUEBA_REGRESO,       // Arranca en regreso + descarga
-  COMPETENCIA           // Ronda completa, arranca con el botón
+  PRUEBA_SENSORES,      // Robot quieto: imprime IR y ultrasonidos cada 200 ms
+  PRUEBA_ESQUIVA,       // Idéntico a PruebaIntegracionUltrasonidos (sin IR ni rumbo)
+  PRUEBA_DEMO,          // Avanza, esquiva, gira 180° en la línea (PB0) y repite
+  PRUEBA_GIRO,          // Calibración por Serial: 'g' giro, 'a' avance, '+'/'-' ajuste
+  PRUEBA_IDA,           // Salida -> esquiva -> línea del cultivo -> escuadra -> homing
+  PRUEBA_BARRIDO,       // Frente a la línea del cultivo: escuadra -> homing -> 3 niveles
+  PRUEBA_REGRESO,       // En la línea del cultivo: giro -> vuelta -> descarga
+  PRUEBA_MECANISMO,     // Robot quieto: elevador, garra y compuerta por Serial
+  PRUEBA_CAPTURA,       // Frente a una pelota: decide, acerca, captura, retira ('r' repite)
+  PRUEBA_RECOLECCION,   // Frente a la línea del cultivo: barrido de 3 niveles CON capturas
+  PRUEBA_RUTINA,        // Rutina completa (con monitor)
+  COMPETENCIA           // Rutina completa: arranca sola tras RETARDO_ARRANQUE_MS
 };
 
 // >>>>>>>>>> CAMBIAR AQUÍ EL MODO Y VOLVER A SUBIR <<<<<<<<<<
-const ModoPrueba MODO = PRUEBA_ESQUIVA;
+const ModoPrueba MODO = PRUEBA_DEMO;
 
-// Subsistemas que se activan según el modo
-const bool LEER_IR        = (MODO != PRUEBA_ESQUIVA);
-const bool USAR_SERVO     = (MODO == PRUEBA_REGRESO || MODO == COMPETENCIA);
-const bool USAR_ELEVADOR  = (MODO == PRUEBA_RECOLECCION || MODO == COMPETENCIA);
+// Subsistemas según el modo
+const bool LEER_IR = (MODO != PRUEBA_ESQUIVA && MODO != PRUEBA_DEMO && MODO != PRUEBA_GIRO &&
+                      MODO != PRUEBA_MECANISMO);
 
-EstadoFSM estadoActual = ESPERA_INICIO;
+// Actuadores. Con HABILITAR_* = false se simulan por Serial (útil si un
+// mecanismo no está montado). En los modos que no los usan no se activan.
+const bool HABILITAR_SERVOS   = false;
+const bool HABILITAR_ELEVADOR = false;
+const bool MODO_CON_MECANISMO = (MODO == PRUEBA_MECANISMO || MODO == PRUEBA_CAPTURA ||
+                                 MODO == PRUEBA_RECOLECCION || MODO == PRUEBA_RUTINA ||
+                                 MODO == COMPETENCIA);
+const bool USAR_SERVO    = HABILITAR_SERVOS   && (MODO_CON_MECANISMO || MODO == PRUEBA_REGRESO);
+const bool USAR_ELEVADOR = HABILITAR_ELEVADOR && MODO_CON_MECANISMO;
+// Recolectar en el barrido (en PRUEBA_BARRIDO solo se navega)
+const bool RECOLECTAR    = false;//(MODO == PRUEBA_RECOLECCION || MODO == PRUEBA_RUTINA || MODO == COMPETENCIA);
+
+// Decisión de captura en cada pelota
+enum ModoDecision { DECISION_TODAS, DECISION_SERIAL, DECISION_CAMARA };
+const ModoDecision MODO_DECISION = DECISION_TODAS;
+
+EstadoFSM estadoActual  = FIN_MISION;
+EstadoFSM estadoTrasGiro = NAVEGAR;   // A dónde ir al terminar GIRO_180
+FaseMision fase          = FASE_IDA;
 
 // ==========================================
 // 3. PINES Y ACTUADORES ADICIONALES
 // ==========================================
-const int pinBotonStart      = 13; // MCP PB5 (pendiente reasignar)
-const int pinServoCompuerta  = 25;
-Servo servoCompuerta;
-
-const int pinStepElevador    = 14; // MCP PB6 (pendiente: el 28BYJ-48 usa IN1-IN4)
-const int pinDirElevador     = 15; // MCP PB7
+// Servo garra: GPIO 19 | Servo compuerta: GPIO 0   (Recoleccion.ino)
+// Elevador 28BYJ-48: MCP PB4-PB7                   (Elevador.ino)
+// Cámara: RX GPIO 16, TX GPIO 17
 int nivelActualH             = 1;
 
 // ==========================================
-// 4. PARÁMETROS DE NAVEGACIÓN (valores de la prueba funcional)
+// 4. PARÁMETROS
 // ==========================================
-const int VELOCIDAD_BASE                    = 120;
-const int UMBRAL_PISCINA_CM                 = 20;   // Detecta obstáculo
-const int UMBRAL_LIBRE_CM                   = 35;   // Considera frente despejado
+// --- Navegación y esquiva (valores de la prueba funcional) ---
+const int VELOCIDAD_BASE                      = 120;
+const int UMBRAL_PISCINA_CM                   = 20;
+const int UMBRAL_LIBRE_CM                     = 35;
 const unsigned long TIEMPO_CONFIRMAR_LIBRE_MS = 800;
-const unsigned long VENTANA_IGNORAR_LINEA_MS  = 1500; // Evita leer líneas de la zona de salida (calibrar)
+const unsigned long TIMEOUT_ESQUIVA_MS        = 6000; // Si no sale, prueba por el otro lado
+// Si el ultrasonido lateral ve partes del propio robot, poner en false.
+const bool USAR_LATERAL_EN_DETECCION = true;
 
-const unsigned long TIMEOUT_HOMING  = 7000;
-const unsigned long TIMEOUT_CAPTURA = 4000;
+// --- Arranque (sin botón) ---
+const unsigned long RETARDO_ARRANQUE_MS = 2000; // Tiempo entre encender y empezar a moverse
+
+// --- Línea ---
+const unsigned long VENTANA_IGNORAR_LINEA_MS = 1500; // Al arrancar y tras cada giro
+// La línea debe verse en negro de forma CONTINUA mientras el robot recorre
+// esta distancia. Filtra puntos y manchas del piso sin importar la velocidad.
+// La línea mide 1.9 cm: no subir de ~1.2. Subir si aún hay falsos disparos.
+const float LONGITUD_MIN_LINEA_CM = 0.8f;
+
+// --- Control de rumbo (odometría de encoders) ---
+const bool  USAR_CONTROL_RUMBO = true;
+const float KP_RUMBO           = 4.0f;  // W por cada grado de error
+const int   W_MAX_RUMBO        = 60;
+
+// --- Giro 180° ---
+const long PULSOS_GIRO_180           = 600;  // CALIBRAR con PRUEBA_GIRO
+long pulsosGiro180                   = PULSOS_GIRO_180;
+const int  VELOCIDAD_GIRO_MAX        = 150;
+const int  VELOCIDAD_GIRO_MIN        = 70;   // Por encima de la zona muerta
+const float TOLERANCIA_GIRO_GRADOS   = 2.0f;
+const unsigned long PAUSA_ANTES_GIRO_MS = 300;
+const unsigned long TIMEOUT_GIRO_MS  = 5000;
+
+// --- Distancias (odometría) ---
+float pulsosPorCm                    = 25.0f; // CALIBRAR con PRUEBA_GIRO ('a')
+const long PULSOS_CALIBRACION_AVANCE = 1500;
+
+// --- Escuadrado ---
+const int V_LENTO                    = 60;   // Avance lento buscando la línea
+const int W_ESCUADRE                 = 60;
+const int SIGNO_ESCUADRE             = 1;    // Si al escuadrar se aleja de la línea, poner -1
+const int LECTURAS_CONFIRMAR_ESCUADRE = 3;
+const unsigned long TIMEOUT_ESCUADRE_MS = 4000;
+
+// --- Homing y barrido ---
+const int V_HOMING                   = 100;
+const int V_BARRIDO                  = 100;
+const float KP_AVANCE                = 0.5f; // Mantiene la distancia a la línea al hacer strafe
+const int   MAX_CORRECCION_AVANCE    = 40;
+const int LECTURAS_CONFIRMAR_MARGEN  = 2;
+const unsigned long TIMEOUT_HOMING_MS       = 8000;
+const unsigned long TIMEOUT_BARRIDO_NIVEL_MS = 12000;
+const unsigned long TIMEOUT_CENTRAR_MS       = 6000;
+const float TOLERANCIA_CENTRAR_CM            = 3.0f;
+// Si el robot pisa un margen mientras navega, se aleja de él con esta velocidad lateral
+const int V_REPELER_MARGEN                   = 60;
+const int NIVELES_BARRIDO            = 3;
+const int UMBRAL_ARBOL_CM            = 25;   // Ultrasonido frontal: a menos de esto hay un árbol
+const unsigned long TIEMPO_LIMITE_RECOLECCION_MS = 150000; // Corta el barrido y regresa
+
+// --- Descarga (AJUSTAR con la geometría real de la cancha) ---
+const int   LADO_RECIPIENTE              = -1;   // -1 = izquierda, +1 = derecha
+const float DESPLAZAMIENTO_DESCARGA_CM   = 0.0f; // 0 = ir hasta el margen
+const unsigned long TIMEOUT_POSICIONAR_MS = 8000;
+const float RETROCESO_DESCARGA_CM        = 10.0f;
+const unsigned long TIMEOUT_RETROCESO_MS = 4000;
+
+// --- Recolección (MEDIR en la cancha y ajustar) ---
+const float DISTANCIA_NIVEL_MM     = 150.0f;           // 390 -> 540 -> 690 mm
+const int   PELOTAS_POR_NIVEL[3]   = {5, 6, 5};        // Por árbol (reglamento)
+const float ANCHO_ARBOL_CM         = 30.0f;            // MEDIR: ancho que ve el ultrasonido
+const float ESPACIO_PELOTAS_CM     = 5.0f;             // MEDIR: separación entre pelotas
+const float OFFSET_RAMPA_CM        = 0.0f;             // Rampa respecto al ultrasonido frontal (+ = derecha)
+const float TOLERANCIA_PELOTA_CM   = 0.7f;
+const int   V_REFINO               = 50;               // Velocidad lenta para medir el borde
+const unsigned long TIMEOUT_REFINO_MS = 3000;
+const int   V_PELOTA_MAX           = 80;
+const int   V_PELOTA_MIN           = 40;
+const unsigned long TIMEOUT_PELOTA_IR_MS = 4000;
+const float ACERCAMIENTO_CM        = 6.0f;             // MEDIR con PRUEBA_CAPTURA
+const int   DIST_MIN_CAPTURA_CM    = 3;                // Freno de seguridad por ultrasonido
+const int   V_ACERCAR              = 70;
+const unsigned long TIMEOUT_ACERCAR_MS  = 2500;
+const unsigned long TIMEOUT_RETIRAR_MS  = 2500;
+const float BAJADA_NIVEL3_MM       = 150.0f;           // Probar menos si la pelota no cae lejos
+const int   CAPACIDAD_ALMACEN      = 0;                // 0 = sin límite
+// Decisión
+const unsigned long DECISION_TIMEOUT_MS     = 15000;   // Serial: sin respuesta -> por defecto
+const bool          DECISION_POR_DEFECTO    = true;
+const unsigned long TIEMPO_ESPERA_CAMARA_MS = 1500;    // Cámara: sin pelota centrada -> no
+// PRUEBA_CAPTURA
+const int NIVEL_PRUEBA_CAPTURA = 1;                    // 1, 2 o 3
+
 const unsigned long WATCHDOG_CAMARA = 800;
+
+// --- Demo: sensor de línea en PB0 con autocalibración ---
+const int pinTrackLinea        = 8;
+const bool AUTO_CALIBRAR_TRACK = true;
+int trackValorNegro            = HIGH;
 
 // ==========================================
 // 5. VARIABLES DE CONTROL
 // ==========================================
 unsigned long tiempoInicioMision = 0;
 unsigned long tiempoInicioEstado = 0;
+unsigned long tiempoArmadoLinea  = 0;
+unsigned long inicioEsquiva      = 0;
+unsigned long inicioGiro         = 0;
+unsigned long ultimoMonitor      = 0;
+unsigned long finGiroCalibracion = 0;  // PRUEBA_GIRO: para medir el giro ya detenido
 bool estadoIniciado              = false;
-int direccionBarrido             = 1;
+
+// Filtro de negro por distancia: un sensor solo cuenta como "sobre línea"
+// si ve negro sin interrupción mientras el robot recorre LONGITUD_MIN_LINEA_CM.
+struct FiltroNegro {
+  bool  viendo = false;
+  float desdeAvance = 0.0f;
+  float desdeLateral = 0.0f;
+};
+FiltroNegro filtroLinea, filtroMargenIzq, filtroMargenDer;
+int contadorEscuadre  = 0;
+int contadorMargen    = 0;
+int trackCrudo        = 0;
+int direccionEsquiva  = 1;   // +1 derecha, -1 izquierda
+int direccionBarrido  = 1;   // +1 derecha, -1 izquierda
+int nivelBarrido      = 1;
+bool frenteAArbol     = false;
+int arbolesVistos     = 0;
+int pelotaIdx         = 0;
+int pelotasCapturadas = 0;
+float bordeArbolLat   = 0.0f;   // Odometría lateral del borde del árbol
+float latPerdido      = 0.0f;   // ARBOL_REFINAR: donde se dejó de ver el árbol
+int   faseRefino      = 0;
+int decisionSerial    = -1;     // -1 = sin respuesta, 0 = no, 1 = sí
+
+// Odometría (en pulsos, marco del robot)
+long encPrev[4]          = {0, 0, 0, 0};
+float odoAvance          = 0.0f;
+float odoLateral         = 0.0f;
+float odoRumbo           = 0.0f;
+float rumboObjetivo      = 0.0f;
+float avanceObjetivo     = 0.0f;
+float rumboInicioGiro    = 0.0f;
+float refAvance          = 0.0f;
+float refLateral         = 0.0f;
+float latMargenIzq       = 0.0f;  // Odometría lateral en el margen izquierdo (homing)
+float latMargenDer       = 0.0f;  // Odometría lateral en el margen derecho (barrido)
+bool  margenDerMedido    = false;
 
 int errorCamaraX                  = 0;
 int errorCamaraY                  = 0;
@@ -112,12 +274,32 @@ void setupMotores();
 void actualizarControlMotores();
 void moverOmni(int Vx, int Vy, int W);
 void pararMotores();
-void resetEncoders();
+long getPulsosM1();
+long getPulsosM2();
+long getPulsosM3();
+long getPulsosM4();
 
 void setupInfrarrojos();
 bool estaSobreLineaFrontal();
 bool detectoMargenIzquierdo();
 bool detectoMargenDerecho();
+float calcularErrorLinea();
+int irFrontalIzq();
+int irFrontalDer();
+
+void setupElevador();
+void elevadorIrAMM(float objetivoMM);
+float posicionElevadorMM();
+void fijarCeroElevador();
+void apagarBobinasElevador();
+extern unsigned long retardoPasoUs;
+
+void setupRecoleccion();
+void garraA(int angulo);
+void compuertaA(int angulo);
+void capturaEstandar();
+void capturaNivel3Bajar(float bajadaMM);
+void descargarCompuerta();
 
 void setupUltrasonidos();
 void actualizarLecturasUltrasonido();
@@ -126,52 +308,151 @@ int leerUltrasonidoLateral();
 int obtenerCorreccionParedPD(int distMedida);
 
 // ==========================================
-// 7. GESTIÓN DE MODOS Y TRANSICIONES
+// 7. ODOMETRÍA Y CONTROL DE RUMBO
+// ==========================================
+// Cinemática de moverOmni:  v1 = Vy+Vx-W, v2 = Vy-Vx+W, v3 = Vy-Vx-W, v4 = Vy+Vx+W
+// Inversa:  avance = (d1+d2+d3+d4)/4, lateral = (d1-d2-d3+d4)/4, rumbo = (-d1+d2-d3+d4)/4
+// W > 0 hace crecer odoRumbo. 180° equivalen a pulsosGiro180.
+void leerEncoders(long p[4]) {
+  p[0] = getPulsosM1(); p[1] = getPulsosM2();
+  p[2] = getPulsosM3(); p[3] = getPulsosM4();
+}
+
+void iniciarOdometria() {
+  leerEncoders(encPrev);
+  odoAvance = odoLateral = odoRumbo = 0.0f;
+  rumboObjetivo = avanceObjetivo = 0.0f;
+}
+
+void actualizarOdometria() {
+  long p[4];
+  leerEncoders(p);
+  float d1 = p[0] - encPrev[0], d2 = p[1] - encPrev[1];
+  float d3 = p[2] - encPrev[2], d4 = p[3] - encPrev[3];
+  for (int i = 0; i < 4; i++) encPrev[i] = p[i];
+
+  odoAvance  += ( d1 + d2 + d3 + d4) / 4.0f;
+  odoLateral += ( d1 - d2 - d3 + d4) / 4.0f;
+  odoRumbo   += (-d1 + d2 - d3 + d4) / 4.0f;
+}
+
+float pulsosAGrados(float p) { return p * 180.0f / (float)pulsosGiro180; }
+float rumboGrados()          { return pulsosAGrados(odoRumbo); }
+float pulsosACm(float p)     { return p / pulsosPorCm; }
+long  cmAPulsos(float cm)    { return (long)(cm * pulsosPorCm); }
+
+bool controlRumboActivo() {
+  return USAR_CONTROL_RUMBO && MODO != PRUEBA_ESQUIVA;
+}
+
+// Corrección de giro para mantener rumboObjetivo
+int correccionRumbo() {
+  if (!controlRumboActivo()) return 0;
+  float errGrados = pulsosAGrados(rumboObjetivo - odoRumbo);
+  return (int)constrain(KP_RUMBO * errGrados, (float)-W_MAX_RUMBO, (float)W_MAX_RUMBO);
+}
+
+// Corrección de avance para no alejarse de la línea al hacer strafe
+int correccionAvance() {
+  float err = avanceObjetivo - odoAvance;
+  return (int)constrain(KP_AVANCE * err, (float)-MAX_CORRECCION_AVANCE, (float)MAX_CORRECCION_AVANCE);
+}
+
+// Fija la referencia actual como "recto" y "a esta distancia de la línea"
+void fijarReferenciasAqui() {
+  rumboObjetivo  = odoRumbo;
+  avanceObjetivo = odoAvance;
+}
+
+// Devuelve true solo si el sensor lleva viendo negro LONGITUD_MIN_LINEA_CM
+bool filtrarNegro(FiltroNegro &f, bool crudo) {
+  if (!crudo) { f.viendo = false; return false; }
+  if (!f.viendo) {
+    f.viendo = true;
+    f.desdeAvance  = odoAvance;
+    f.desdeLateral = odoLateral;
+  }
+  float recorridoCm = pulsosACm(fabs(odoAvance - f.desdeAvance) +
+                                fabs(odoLateral - f.desdeLateral));
+  return recorridoCm >= LONGITUD_MIN_LINEA_CM;
+}
+
+// ==========================================
+// 8. GESTIÓN DE MODOS Y TRANSICIONES
 // ==========================================
 const char* nombreEstado(EstadoFSM e) {
   switch (e) {
-    case ESPERA_INICIO:          return "ESPERA_INICIO";
-    case IR_A_CULTIVO:           return "IR_A_CULTIVO";
-    case ESQUIVAR_PISCINA:       return "ESQUIVAR_PISCINA";
-    case VERIFICAR_LIBERACION:   return "VERIFICAR_LIBERACION";
-    case HOMING_Y_ESCUADRADO:    return "HOMING_Y_ESCUADRADO";
-    case RECOLECCION_MULTINIVEL: return "RECOLECCION_MULTINIVEL";
-    case ALINEAR_Y_CAPTURAR:     return "ALINEAR_Y_CAPTURAR";
-    case REGRESO_BENEFICIADERO:  return "REGRESO_BENEFICIADERO";
-    case DESCARGA_PAYLOAD:       return "DESCARGA_PAYLOAD";
-    case FIN_MISION:             return "FIN_MISION";
-    case ESTADO_ERROR:           return "ESTADO_ERROR";
+    case NAVEGAR:              return "NAVEGAR";
+    case ESQUIVAR_PISCINA:     return "ESQUIVAR_PISCINA";
+    case VERIFICAR_LIBERACION: return "VERIFICAR_LIBERACION";
+    case ESCUADRAR:            return "ESCUADRAR";
+    case HOMING_MARGEN:        return "HOMING_MARGEN";
+    case BARRIDO:              return "BARRIDO";
+    case CENTRAR_FILA:         return "CENTRAR_FILA";
+    case ARBOL_REFINAR:        return "ARBOL_REFINAR";
+    case PELOTA_IR:            return "PELOTA_IR";
+    case PELOTA_DECIDIR:       return "PELOTA_DECIDIR";
+    case PELOTA_ACERCAR:       return "PELOTA_ACERCAR";
+    case PELOTA_CAPTURAR:      return "PELOTA_CAPTURAR";
+    case PELOTA_RETIRAR:       return "PELOTA_RETIRAR";
+    case GIRO_180:             return "GIRO_180";
+    case POSICIONAR_DESCARGA:  return "POSICIONAR_DESCARGA";
+    case RETROCEDER_DESCARGA:  return "RETROCEDER_DESCARGA";
+    case DESCARGA_PAYLOAD:     return "DESCARGA_PAYLOAD";
+    case CALIB_AVANCE:         return "CALIB_AVANCE";
+    case FIN_MISION:           return "FIN_MISION";
+    case ESTADO_ERROR:         return "ESTADO_ERROR";
   }
   return "?";
 }
 
 EstadoFSM estadoInicial() {
   switch (MODO) {
-    case PRUEBA_ESQUIVA:
-    case PRUEBA_IR_A_CULTIVO: return IR_A_CULTIVO;
-    case PRUEBA_HOMING:       return HOMING_Y_ESCUADRADO;
-    case PRUEBA_RECOLECCION:  return RECOLECCION_MULTINIVEL;
-    case PRUEBA_REGRESO:      return REGRESO_BENEFICIADERO;
-    case COMPETENCIA:         return ESPERA_INICIO;
+    case PRUEBA_SENSORES: return FIN_MISION;
+    case PRUEBA_ESQUIVA:  return NAVEGAR;
+    case PRUEBA_DEMO:     return NAVEGAR;
+    case PRUEBA_GIRO:     return FIN_MISION;   // Quieto hasta 'g' o 'a'
+    case PRUEBA_IDA:      return NAVEGAR;
+    case PRUEBA_BARRIDO:  return ESCUADRAR;
+    case PRUEBA_REGRESO:  return GIRO_180;
+    case PRUEBA_MECANISMO:   return FIN_MISION;   // Quieto, comandos por Serial
+    case PRUEBA_CAPTURA:     return PELOTA_DECIDIR;
+    case PRUEBA_RECOLECCION: return ESCUADRAR;
+    case PRUEBA_RUTINA:   return NAVEGAR;
+    case COMPETENCIA:     return NAVEGAR;
   }
-  return ESPERA_INICIO;
+  return FIN_MISION;
+}
+
+bool esEstadoDeNavegacion(EstadoFSM e) {
+  return (e == NAVEGAR || e == ESQUIVAR_PISCINA || e == VERIFICAR_LIBERACION);
+}
+
+bool esEstadoDePelota(EstadoFSM e) {
+  return (e == ARBOL_REFINAR || e == PELOTA_IR || e == PELOTA_DECIDIR || e == PELOTA_ACERCAR ||
+          e == PELOTA_CAPTURAR || e == PELOTA_RETIRAR);
 }
 
 bool estadoPermitido(EstadoFSM e) {
   if (e == FIN_MISION || e == ESTADO_ERROR) return true;
 
   switch (MODO) {
-    case PRUEBA_ESQUIVA:
-    case PRUEBA_IR_A_CULTIVO:
-      return (e == IR_A_CULTIVO || e == ESQUIVAR_PISCINA || e == VERIFICAR_LIBERACION);
-    case PRUEBA_HOMING:
-      return (e == HOMING_Y_ESCUADRADO);
+    case PRUEBA_SENSORES: return false;
+    case PRUEBA_ESQUIVA:  return esEstadoDeNavegacion(e);
+    case PRUEBA_DEMO:     return esEstadoDeNavegacion(e) || e == GIRO_180;
+    case PRUEBA_GIRO:     return (e == GIRO_180 || e == CALIB_AVANCE);
+    case PRUEBA_IDA:      return esEstadoDeNavegacion(e) || e == ESCUADRAR || e == HOMING_MARGEN;
+    case PRUEBA_BARRIDO:  return (e == ESCUADRAR || e == HOMING_MARGEN || e == BARRIDO || e == CENTRAR_FILA);
+    case PRUEBA_REGRESO:  return esEstadoDeNavegacion(e) || e == GIRO_180 || e == ESCUADRAR ||
+                                 e == POSICIONAR_DESCARGA || e == RETROCEDER_DESCARGA ||
+                                 e == DESCARGA_PAYLOAD;
+    case PRUEBA_MECANISMO: return false;
+    case PRUEBA_CAPTURA:   return esEstadoDePelota(e);
     case PRUEBA_RECOLECCION:
-      return (e == RECOLECCION_MULTINIVEL || e == ALINEAR_Y_CAPTURAR);
-    case PRUEBA_REGRESO:
-      return (e == REGRESO_BENEFICIADERO || e == DESCARGA_PAYLOAD);
-    case COMPETENCIA:
-      return true;
+      return (e == ESCUADRAR || e == HOMING_MARGEN || e == BARRIDO || e == CENTRAR_FILA ||
+              esEstadoDePelota(e));
+    case PRUEBA_RUTINA:
+    case COMPETENCIA:     return true;
   }
   return false;
 }
@@ -225,40 +506,121 @@ void cambiarEstado(EstadoFSM nuevoEstado, bool parar) {
   }
 }
 
-// ==========================================
-// 8. ACTUADORES SECUNDARIOS
-// ==========================================
-void moverElevadorANivel(int nivel) {
-  if (!USAR_ELEVADOR) return;
-  pararMotores();
-  if (nivel == nivelActualH) return;
+// Prepara y lanza un giro de 180° indicando a dónde seguir después
+void iniciarGiro180(EstadoFSM siguiente) {
+  estadoTrasGiro = siguiente;
+  cambiarEstado(GIRO_180, true);
+}
 
-  mcp.digitalWrite(pinDirElevador, (nivel > nivelActualH) ? HIGH : LOW);
-  int pasos = abs(nivel - nivelActualH) * 400; // TODO: calcular con el piñón real
-
-  for (int i = 0; i < pasos; i++) {
-    mcp.digitalWrite(pinStepElevador, HIGH);
-    delayMicroseconds(800);
-    mcp.digitalWrite(pinStepElevador, LOW);
-    delayMicroseconds(800);
+// Qué hacer al detectar la línea al frente
+void alDetectarLinea() {
+  if (MODO == PRUEBA_DEMO) {
+    iniciarGiro180(NAVEGAR);
+  } else {
+    cambiarEstado(ESCUADRAR, true);
   }
-  nivelActualH = nivel;
+}
 
-  while (Serial2.available() > 0) Serial2.read();
+// Prepara y lanza un giro de 180° indicando a dónde seguir después
+void iniciarGiro180(EstadoFSM siguiente) {
+  estadoTrasGiro = siguiente;
+  cambiarEstado(GIRO_180, true);
+}
+
+// Qué hacer al detectar la línea al frente
+void alDetectarLinea() {
+  if (MODO == PRUEBA_DEMO) {
+    iniciarGiro180(NAVEGAR);
+  } else {
+    cambiarEstado(ESCUADRAR, true);
+  }
+}
+
+// ==========================================
+// 9. ACTUADORES SECUNDARIOS
+// ==========================================
+float alturaNivelMM(int nivel) {
+  return (nivel - 1) * DISTANCIA_NIVEL_MM;
+}
+
+void moverElevadorANivel(int nivel) {
+  pararMotores();
+  nivelActualH = nivel;
+  if (!USAR_ELEVADOR) {
+    Serial.printf("[ELEVADOR] Nivel %d (simulado)\n", nivel);
+    return;
+  }
+  Serial.printf("[ELEVADOR] Moviendo a nivel %d (%.0f mm)...\n", nivel, alturaNivelMM(nivel));
+  elevadorIrAMM(alturaNivelMM(nivel));
+  while (Serial2.available() > 0) Serial2.read();   // Descarta tramas viejas de la cámara
   ultimaLecturaCamara = millis();
 }
 
 void abrirCompuertaDescarga() {
-  if (!USAR_SERVO) return;
-  servoCompuerta.write(90);
-  delay(2000);
-  servoCompuerta.write(0);
+  if (!USAR_SERVO) {
+    Serial.println("[DESCARGA] Compuerta abierta 2.5 s (simulado)");
+    delay(500);
+    return;
+  }
+  descargarCompuerta();
   while (Serial2.available() > 0) Serial2.read();
 }
 
-void ejecutarMecanismoRecolector() {
-  delay(250);
+// Secuencia de captura según el nivel (bloqueante, robot detenido)
+void ejecutarCaptura(int nivel) {
+  if (!USAR_SERVO) {
+    Serial.printf("[CAPTURA] Nivel %d (simulado)\n", nivel);
+    delay(nivel < 3 ? 1500 : 3000);
+    return;
+  }
+  if (nivel < 3) {
+    capturaEstandar();
+  } else {
+    if (USAR_ELEVADOR) capturaNivel3Bajar(BAJADA_NIVEL3_MM);
+    else               capturaEstandar();
+  }
   while (Serial2.available() > 0) Serial2.read();
+}
+
+// ---------- Control de la recolección ----------
+bool recoleccionSinTiempo() {
+  return (MODO != PRUEBA_CAPTURA) &&
+         (millis() - tiempoInicioMision > TIEMPO_LIMITE_RECOLECCION_MS);
+}
+
+// Corta la recolección: baja el elevador y va a regresar
+void terminarRecoleccion(const char* motivo) {
+  Serial.printf("-> %s. Centrando en la fila antes de regresar.\n", motivo);
+  fase = FASE_VUELTA;
+  moverElevadorANivel(1);
+  cambiarEstado(CENTRAR_FILA, true);
+}
+
+// Prepara un nivel del barrido (se llama al terminar el homing y al cambiar de nivel)
+void iniciarNivelBarrido() {
+  contadorMargen = 0;
+  frenteAArbol = false;
+  Serial.printf("-> Barrido nivel %d hacia la %s\n", nivelBarrido,
+                (direccionBarrido > 0) ? "derecha" : "izquierda");
+}
+
+// Pasa a la siguiente pelota del árbol, o vuelve al barrido si ya terminó
+void siguientePelota() {
+  pelotaIdx++;
+  if (CAPACIDAD_ALMACEN > 0 && pelotasCapturadas >= CAPACIDAD_ALMACEN) {
+    terminarRecoleccion("Almacén lleno");
+    return;
+  }
+  if (recoleccionSinTiempo()) {
+    terminarRecoleccion("Tiempo límite de recolección");
+    return;
+  }
+  if (pelotaIdx < PELOTAS_POR_NIVEL[nivelBarrido - 1]) {
+    cambiarEstado(PELOTA_IR, true);
+  } else {
+    Serial.printf("   Árbol terminado en el nivel %d\n", nivelBarrido);
+    cambiarEstado(BARRIDO, true);   // frenteAArbol sigue en true: no se repite este árbol
+  }
 }
 
 // ==========================================
@@ -289,13 +651,141 @@ void procesarCamaraVision() {
 }
 
 // ==========================================
-// 10. SETUP
+// 11. DIAGNÓSTICO, MONITOR Y COMANDOS SERIAL
+// ==========================================
+// Mapeo (Infrarojos.ino): PB0 = frontal der, PB1 = frontal izq,
+//                         PB2 = lateral izq, PB3 = lateral der
+const unsigned long INTERVALO_DIAGNOSTICO_MS = 200;
+unsigned long ultimoDiagnostico = 0;
+
+void imprimirDiagnosticoSensores(int distFrontal, int distLateral) {
+  if (millis() - ultimoDiagnostico < INTERVALO_DIAGNOSTICO_MS) return;
+  ultimoDiagnostico = millis();
+
+  uint8_t puertoB = mcp.readGPIOB();
+  int rawPB0 = (puertoB >> 0) & 1;
+  int rawPB1 = (puertoB >> 1) & 1;
+  int rawPB2 = (puertoB >> 2) & 1;
+  int rawPB3 = (puertoB >> 3) & 1;
+
+  float posLinea = calcularErrorLinea();
+
+  Serial.printf("CRUDO FrIzq(PB1)=%d FrDer(PB0)=%d LatIzq(PB2)=%d LatDer(PB3)=%d",
+                rawPB1, rawPB0, rawPB2, rawPB3);
+  Serial.printf("  | NEGRO? fr=%d %d lat=%d %d pos=",
+                irFrontalIzq(), irFrontalDer(),
+                detectoMargenIzquierdo() ? 1 : 0, detectoMargenDerecho() ? 1 : 0);
+  if (posLinea >= 999.0f) Serial.print(" ---");
+  else                    Serial.printf("%+.2f", posLinea);
+  Serial.printf("  | US F=%3d L=%3d | rumbo=%+.1f°\n", distFrontal, distLateral, rumboGrados());
+}
+
+// Monitor de los modos en movimiento (cada 300 ms)
+void imprimirMonitor(int distFrontal, int distLateral, bool lineaCruda,
+                     bool margenIzq, bool margenDer) {
+  if (millis() - ultimoMonitor < 300) return;
+  ultimoMonitor = millis();
+  Serial.printf("[MON] %-20s %s N%d | linea=%d mIzq=%d mDer=%d | US F=%3d L=%3d | rumbo=%+6.1f° av=%+6.1fcm lat=%+6.1fcm | elev=%3.0fmm cap=%d\n",
+                nombreEstado(estadoActual), (fase == FASE_IDA) ? "IDA  " : "VUELTA",
+                nivelBarrido, lineaCruda ? 1 : 0, margenIzq ? 1 : 0, margenDer ? 1 : 0,
+                distFrontal, distLateral, rumboGrados(),
+                pulsosACm(odoAvance), pulsosACm(odoLateral),
+                posicionElevadorMM(), pelotasCapturadas);
+}
+
+void imprimirMenuMecanismo() {
+  Serial.println("--- PRUEBA MECANISMO (robot quieto) ---");
+  Serial.println(" '1' '2' '3' = elevador a nivel | 'u' +10 mm | 'j' -10 mm | 'z' fijar cero aquí");
+  Serial.println(" 'f' elevador más rápido | 'l' más lento");
+  Serial.println(" 'c' captura estándar | 'e' captura nivel 3 (baja, suelta y vuelve a subir)");
+  Serial.println(" 'a' abrir y cerrar compuerta");
+}
+
+void comandoMecanismo(char c) {
+  bool movio = true;
+  if (c == '1' || c == '2' || c == '3') {
+    moverElevadorANivel(c - '0');
+  } else if (c == 'u' || c == 'j') {
+    if (USAR_ELEVADOR) elevadorIrAMM(posicionElevadorMM() + ((c == 'u') ? 10.0f : -10.0f));
+  } else if (c == 'z') {
+    fijarCeroElevador();
+    Serial.println(">>> Posición actual fijada como 0 mm (nivel 1)");
+  } else if (c == 'f') {
+    retardoPasoUs = max(600UL, retardoPasoUs - 100);
+  } else if (c == 'l') {
+    retardoPasoUs += 100;
+  } else if (c == 'c') {
+    ejecutarCaptura(1);
+  } else if (c == 'e') {
+    float altura = posicionElevadorMM();
+    ejecutarCaptura(3);
+    if (USAR_ELEVADOR) elevadorIrAMM(altura);
+  } else if (c == 'a') {
+    abrirCompuertaDescarga();
+  } else {
+    movio = false;
+  }
+  if (movio) Serial.printf(">>> Elevador: %.1f mm | retardo de paso: %lu us\n",
+                           posicionElevadorMM(), retardoPasoUs);
+}
+
+// Comandos por Serial según el modo:
+//  PRUEBA_GIRO:      'g' giro 180°, 'a' avance recto, '+'/'-' y '>'/'<' ajustan el giro
+//  PRUEBA_MECANISMO: ver imprimirMenuMecanismo()
+//  PRUEBA_CAPTURA:   'r' repetir la captura
+//  DECISION_SERIAL:  's' capturar / 'n' omitir la pelota actual
+void procesarComandosSerial() {
+  while (Serial.available() > 0) {
+    char c = Serial.read();
+
+    if (MODO == PRUEBA_GIRO) {
+      long antes = pulsosGiro180;
+      if (c == '+') pulsosGiro180 += 100;
+      if (c == '-') pulsosGiro180 = max(100L, pulsosGiro180 - 100);
+      if (c == '>') pulsosGiro180 += 20;
+      if (c == '<') pulsosGiro180 = max(100L, pulsosGiro180 - 20);
+      if (pulsosGiro180 != antes) Serial.printf(">>> pulsosGiro180 = %ld\n", pulsosGiro180);
+      if (estadoActual == FIN_MISION) {
+        if (c == 'g') iniciarGiro180(FIN_MISION);
+        if (c == 'a') cambiarEstado(CALIB_AVANCE, true);
+      }
+    }
+
+    if (MODO == PRUEBA_MECANISMO) comandoMecanismo(c);
+
+    if (MODO == PRUEBA_CAPTURA && estadoActual == FIN_MISION && c == 'r') {
+      pelotaIdx = 0;
+      cambiarEstado(PELOTA_DECIDIR, true);
+    }
+
+    if (estadoActual == PELOTA_DECIDIR && MODO_DECISION == DECISION_SERIAL) {
+      if (c == 's') decisionSerial = 1;
+      if (c == 'n') decisionSerial = 0;
+    }
+  }
+}
+
+void autocalibrarTrack() {
+  int altos = 0;
+  for (int i = 0; i < 10; i++) {
+    if (mcp.digitalRead(pinTrackLinea) == HIGH) altos++;
+    delay(5);
+  }
+  int valorBlanco = (altos >= 5) ? HIGH : LOW;
+  trackValorNegro = (valorBlanco == HIGH) ? LOW : HIGH;
+  Serial.printf("[TRACK] Autocalibrado: blanco=%d, negro=%d (el robot debe arrancar sobre blanco)\n",
+                valorBlanco, trackValorNegro);
+}
+
+// ==========================================
+// 12. SETUP
 // ==========================================
 void setup() {
   Serial.begin(115200);
-  Serial2.begin(115200, SERIAL_8N1, 16, 26); // TX 26, RX 16
+  Serial2.begin(115200, SERIAL_8N1, 16, 17);   // Cámara: RX 16, TX 17
 
   Wire.begin(21, 22);
+  Wire.setClock(400000);   // I2C rápido (probado por el equipo): motores y elevador
   if (!mcp.begin_I2C()) {
     Serial.println("Error al iniciar MCP23017");
     while (1);
@@ -304,6 +794,7 @@ void setup() {
   setupMotores();
   setupUltrasonidos();
   pararMotores();
+  iniciarOdometria();
 
   if (LEER_IR) setupInfrarrojos();
 
@@ -326,6 +817,7 @@ void setup() {
     estadoActual = estadoInicial();
     tiempoInicioMision = millis();
     tiempoInicioEstado = millis();
+    tiempoArmadoLinea  = millis();
     Serial.printf("--- MODO PRUEBA: arranca en %s ---\n", nombreEstado(estadoActual));
 
     // Notificar el modo inicial a la Raspberry Pi según el estado de arranque
@@ -340,12 +832,14 @@ void setup() {
 }
 
 // ==========================================
-// 11. LOOP PRINCIPAL
+// 13. LOOP PRINCIPAL
 // ==========================================
 void loop() {
+  procesarComandosSerial();
   actualizarControlMotores();
-  actualizarLecturasUltrasonido();
+  actualizarLecturasUltrasonido();   // Puede bloquear hasta ~15 ms (pulseIn)
   procesarCamaraVision();
+  actualizarOdometria();             // Después del ultrasonido: odometría al día para la línea
 
   if (millis() - ultimaLecturaCamara > WATCHDOG_CAMARA) {
     pelotaCentrada = false;
@@ -362,14 +856,38 @@ void loop() {
   else if (distFrontal < 999)                 distParedEfectiva = distFrontal;
   else if (distLateral < 999)                 distParedEfectiva = distLateral;
 
-  // --- Infrarrojos ---
-  bool lineaFrontal = false, margenIzq = false, margenDer = false;
+  // --- Infrarrojos (filtrados por distancia para ignorar puntos del piso) ---
+  bool lineaCruda = false, margenIzq = false, margenDer = false;
   if (LEER_IR) {
-    lineaFrontal = estaSobreLineaFrontal();
-    margenIzq    = detectoMargenIzquierdo();
-    margenDer    = detectoMargenDerecho();
+    lineaCruda = estaSobreLineaFrontal();
+    margenIzq  = filtrarNegro(filtroMargenIzq, detectoMargenIzquierdo());
+    margenDer  = filtrarNegro(filtroMargenDer, detectoMargenDerecho());
   }
-  bool lineaArmada = (millis() - tiempoInicioMision > VENTANA_IGNORAR_LINEA_MS);
+  if (MODO == PRUEBA_DEMO) {
+    trackCrudo = mcp.digitalRead(pinTrackLinea);
+    lineaCruda = (trackCrudo == trackValorNegro);
+  }
+  bool lineaFrontal = filtrarNegro(filtroLinea, lineaCruda);
+  bool lineaArmada  = (millis() - tiempoArmadoLinea > VENTANA_IGNORAR_LINEA_MS);
+
+  if (MODO == PRUEBA_SENSORES) {
+    imprimirDiagnosticoSensores(distFrontal, distLateral);
+    return;
+  }
+
+  // PRUEBA_GIRO: reporte del giro completo, incluida la inercia tras frenar
+  if (finGiroCalibracion != 0 && millis() - finGiroCalibracion > 800) {
+    float total = odoRumbo - rumboInicioGiro;
+    Serial.printf("   Giro total ya detenido: %.0f pulsos.\n", total);
+    Serial.printf("   Si el robot giró A grados reales: PULSOS_GIRO_180 = %.0f * 180 / A\n", total);
+    finGiroCalibracion = 0;
+  }
+
+  if (MODO != PRUEBA_ESQUIVA && estadoActual != FIN_MISION) {
+    imprimirMonitor(distFrontal, distLateral, lineaCruda, margenIzq, margenDer);
+  }
+
+  int wRumbo = correccionRumbo();
 
   // ==========================================
   // MÁQUINA DE ESTADOS
@@ -387,24 +905,49 @@ void loop() {
     case IR_A_CULTIVO:
       moverOmni(0, VELOCIDAD_BASE, 0);
 
-      if (distFrontal >= 3 && distFrontal < UMBRAL_PISCINA_CM) {
-        Serial.println("-> Obstáculo detectado. Iniciando esquiva...");
+      if ((distFrontal >= 3 && distFrontal < UMBRAL_PISCINA_CM) ||
+          (USAR_LATERAL_EN_DETECCION && distLateral >= 3 && distLateral < UMBRAL_PISCINA_CM)) {
+        Serial.printf("-> Obstáculo detectado. Frontal: %d cm | Lateral: %d cm. Iniciando esquiva...\n",
+                      distFrontal, distLateral);
+        direccionEsquiva = 1;      // Por defecto a la derecha
+        inicioEsquiva = millis();
         cambiarEstado(ESQUIVAR_PISCINA, true);
         break;
       }
       if (lineaFrontal && lineaArmada) {
-        cambiarEstado(HOMING_Y_ESCUADRADO, true);
+        alDetectarLinea();
       }
       break;
+    }
 
     case ESQUIVAR_PISCINA: {
-      int correccionPD = obtenerCorreccionParedPD(distParedEfectiva);
-      moverOmni(VELOCIDAD_BASE, correccionPD, 0);
+      if (direccionEsquiva > 0) {
+        int correccionPD = obtenerCorreccionParedPD(distParedEfectiva);
+        moverOmni(VELOCIDAD_BASE, correccionPD, wRumbo);
+      } else {
+        moverOmni(-VELOCIDAD_BASE, 0, wRumbo); // A la izquierda solo con el frontal
+      }
 
       if (lineaFrontal && lineaArmada) {
-        cambiarEstado(HOMING_Y_ESCUADRADO, true);
+        alDetectarLinea();
         break;
       }
+
+      // Robustez (no aplica en PRUEBA_ESQUIVA para conservar la prueba original)
+      if (MODO != PRUEBA_ESQUIVA) {
+        bool margenAlFrente = (direccionEsquiva > 0) ? margenDer : margenIzq;
+        bool sinSalida = (millis() - inicioEsquiva > TIMEOUT_ESQUIVA_MS);
+        if (margenAlFrente || sinSalida) {
+          direccionEsquiva = -direccionEsquiva;
+          inicioEsquiva = millis();
+          Serial.printf("-> Esquiva: %s. Cambiando a la %s\n",
+                        margenAlFrente ? "margen alcanzado" : "timeout",
+                        (direccionEsquiva > 0) ? "derecha" : "izquierda");
+          pararMotores();
+          break;
+        }
+      }
+
       if (distFrontal > UMBRAL_LIBRE_CM && distFrontal < 300) {
         Serial.println("-> Frente despejado. Verificando liberación...");
         cambiarEstado(VERIFICAR_LIBERACION, false);
@@ -413,16 +956,24 @@ void loop() {
     }
 
     case VERIFICAR_LIBERACION: {
-      int correccionPD = obtenerCorreccionParedPD(distParedEfectiva);
-      moverOmni(VELOCIDAD_BASE, correccionPD, 0);
+      if (direccionEsquiva > 0) {
+        int correccionPD = obtenerCorreccionParedPD(distParedEfectiva);
+        moverOmni(VELOCIDAD_BASE, correccionPD, wRumbo);
+      } else {
+        moverOmni(-VELOCIDAD_BASE, 0, wRumbo);
+      }
 
+      if (lineaFrontal && lineaArmada) {
+        alDetectarLinea();
+        break;
+      }
       if (distFrontal >= 3 && distFrontal <= UMBRAL_LIBRE_CM) {
         cambiarEstado(ESQUIVAR_PISCINA, false);
         break;
       }
       if (millis() - tiempoInicioEstado > TIEMPO_CONFIRMAR_LIBRE_MS) {
         Serial.println("-> Obstáculo superado. Reanudando avance...");
-        cambiarEstado(IR_A_CULTIVO, true);
+        cambiarEstado(NAVEGAR, true);
       }
       break;
     }
@@ -450,27 +1001,143 @@ void loop() {
       }
       if ((direccionBarrido == 1 && margenDer) || (direccionBarrido == -1 && margenIzq)) {
         pararMotores();
-        if (nivelActualH < 3) {
-          moverElevadorANivel(nivelActualH + 1);
-          direccionBarrido *= -1;
-        } else {
-          moverElevadorANivel(1);
-          cambiarEstado(REGRESO_BENEFICIADERO, true);
-          break;
+        if (direccionBarrido > 0 && contadorMargen >= LECTURAS_CONFIRMAR_MARGEN) {
+          latMargenDer = odoLateral;
+          margenDerMedido = true;
         }
-      }
-      moverOmni(direccionBarrido * 120, 0, 0);
-      break;
-
-    case ALINEAR_Y_CAPTURAR:
-      if (millis() - tiempoInicioEstado > TIMEOUT_CAPTURA) {
-        cambiarEstado(RECOLECCION_MULTINIVEL, true);
+        if (nivelBarrido < NIVELES_BARRIDO) {
+          nivelBarrido++;
+          direccionBarrido = -direccionBarrido;
+          moverElevadorANivel(nivelBarrido);
+          iniciarNivelBarrido();
+          estadoIniciado = false;          // Reinicia el nivel dentro del mismo estado
+          tiempoInicioEstado = millis();
+        } else {
+          Serial.println("-> Barrido completo. Centrando en la fila antes de regresar.");
+          fase = FASE_VUELTA;
+          moverElevadorANivel(1);
+          cambiarEstado(CENTRAR_FILA, true);
+        }
         break;
       }
-      if (pelotaCentrada) {
+      moverOmni(direccionBarrido * V_BARRIDO, correccionAvance(), wRumbo);
+      break;
+    }
+
+    // ---------- CENTRAR EN LA FILA ANTES DE REGRESAR ----------
+    // Evita regresar pegado a un margen (con un pequeño desvío lo pisaría).
+    case CENTRAR_FILA: {
+      if (!margenDerMedido) {               // Sin dato del margen derecho: no centrar
+        iniciarGiro180(NAVEGAR);
+        break;
+      }
+      float objetivoLat = (latMargenIzq + latMargenDer) / 2.0f;
+      float faltaCm = pulsosACm(objetivoLat - odoLateral);
+      if (fabs(faltaCm) <= TOLERANCIA_CENTRAR_CM ||
+          millis() - tiempoInicioEstado > TIMEOUT_CENTRAR_MS) {
+        Serial.printf("-> Centrado en la fila (faltaban %.1f cm). Regresando.\n", faltaCm);
+        iniciarGiro180(NAVEGAR);
+        break;
+      }
+      int vx = (faltaCm > 0) ? V_BARRIDO : -V_BARRIDO;
+      if (fabs(faltaCm) < 10.0f) vx /= 2;    // Más despacio al final
+      moverOmni(vx, correccionAvance(), wRumbo);
+      break;
+    }
+
+    // ---------- RECOLECCIÓN: BORDE PRECISO DEL ÁRBOL ----------
+    // El ultrasonido se actualiza cada ~70 ms: a velocidad de barrido el borde
+    // se detecta tarde. Se retrocede despacio hasta perder el árbol y se vuelve
+    // hasta verlo otra vez; el promedio de ambos puntos cancela ese retraso.
+    case ARBOL_REFINAR: {
+      if (!estadoIniciado) {
+        estadoIniciado = true;
+        faseRefino = 0;
+      }
+      bool arbolVisto = (distFrontal >= 3 && distFrontal < UMBRAL_ARBOL_CM);
+
+      if (millis() - tiempoInicioEstado > TIMEOUT_REFINO_MS) {
+        bordeArbolLat = odoLateral;            // Respaldo: usar la posición actual
+        pelotaIdx = 0;
+        Serial.println("   [ÁRBOL] Refinado por TIMEOUT: se usa la posición actual");
+        cambiarEstado(PELOTA_IR, true);
+        break;
+      }
+      if (faseRefino == 0) {
+        if (!arbolVisto) { latPerdido = odoLateral; faseRefino = 1; }
+        else moverOmni(-direccionBarrido * V_REFINO, correccionAvance(), wRumbo);
+      }
+      if (faseRefino == 1) {
+        if (arbolVisto) {
+          bordeArbolLat = (latPerdido + odoLateral) / 2.0f;
+          pelotaIdx = 0;
+          cambiarEstado(PELOTA_IR, true);
+          break;
+        }
+        moverOmni(direccionBarrido * V_REFINO, correccionAvance(), wRumbo);
+      }
+      break;
+    }
+
+    // ---------- RECOLECCIÓN: PELOTA A PELOTA ----------
+    // Posición de la pelota i en el árbol: desde el borde detectado, centradas
+    // en ANCHO_ARBOL_CM y separadas ESPACIO_PELOTAS_CM, en el sentido del barrido.
+    case PELOTA_IR: {
+      if (recoleccionSinTiempo()) {
+        terminarRecoleccion("Tiempo límite de recolección");
+        break;
+      }
+      int k = PELOTAS_POR_NIVEL[nivelBarrido - 1];
+      float offsetPrimeraCm = (ANCHO_ARBOL_CM - (k - 1) * ESPACIO_PELOTAS_CM) / 2.0f;
+      float posCm = offsetPrimeraCm + pelotaIdx * ESPACIO_PELOTAS_CM;
+      float objetivo = bordeArbolLat + cmAPulsos(direccionBarrido * posCm - OFFSET_RAMPA_CM);
+      float faltaCm = pulsosACm(objetivo - odoLateral);
+
+      if (fabs(faltaCm) <= TOLERANCIA_PELOTA_CM ||
+          millis() - tiempoInicioEstado > TIMEOUT_PELOTA_IR_MS) {
+        cambiarEstado(PELOTA_DECIDIR, true);
+        break;
+      }
+      int vx = (int)constrain(faltaCm * 8.0f, (float)-V_PELOTA_MAX, (float)V_PELOTA_MAX);
+      if (abs(vx) < V_PELOTA_MIN) vx = (faltaCm > 0) ? V_PELOTA_MIN : -V_PELOTA_MIN;
+      moverOmni(vx, correccionAvance(), wRumbo);
+      break;
+    }
+
+    case PELOTA_DECIDIR: {
+      int k = PELOTAS_POR_NIVEL[nivelBarrido - 1];
+      if (!estadoIniciado) {
+        estadoIniciado = true;
         pararMotores();
-        ejecutarMecanismoRecolector();
-        cambiarEstado(RECOLECCION_MULTINIVEL, true);
+        decisionSerial = -1;
+        if (MODO_DECISION == DECISION_SERIAL) {
+          Serial.printf("?? Nivel %d, pelota %d de %d: ¿capturar? (s/n)\n",
+                        nivelBarrido, pelotaIdx + 1, k);
+        }
+      }
+
+      int decision = -1;   // -1 = aún esperando
+      switch (MODO_DECISION) {
+        case DECISION_TODAS:
+          decision = 1;
+          break;
+        case DECISION_SERIAL:
+          if (decisionSerial >= 0) decision = decisionSerial;
+          else if (millis() - tiempoInicioEstado > DECISION_TIMEOUT_MS) {
+            decision = DECISION_POR_DEFECTO ? 1 : 0;
+            Serial.println("   Sin respuesta: se usa la decisión por defecto");
+          }
+          break;
+        case DECISION_CAMARA:
+          // Provisional: se ajusta cuando se defina el protocolo de la cámara
+          if (pelotaCentrada) decision = 1;
+          else if (millis() - tiempoInicioEstado > TIEMPO_ESPERA_CAMARA_MS) decision = 0;
+          break;
+      }
+      if (decision < 0) break;
+
+      if (decision == 1) {
+        cambiarEstado(PELOTA_ACERCAR, true);
       } else {
         int vx = 0;
         if (abs(errorCamaraX) > 12) { // Zona muerta de 12 px
@@ -480,21 +1147,48 @@ void loop() {
       }
       break;
 
-    // ---------- REGRESO Y DESCARGA ----------
+    // ---------- REGRESO Y DESCARGA (esqueleto) ----------
     case REGRESO_BENEFICIADERO:
+      // TODO: al entrar, el IR frontal puede seguir sobre la línea del cultivo
+      // -> agregar ventana de ignorar línea desde la entrada al estado.
+      // TODO: en reversa los ultrasonidos apuntan al lado contrario.
       if (lineaFrontal) {
         cambiarEstado(DESCARGA_PAYLOAD, true);
         break;
       }
-      if (distFrontal >= 3 && distFrontal < UMBRAL_PISCINA_CM) moverOmni(150, 0, 0);
-      else                                                     moverOmni(0, -180, 0);
+      moverOmni(0, -V_LENTO, wRumbo);
       break;
+    }
 
     case DESCARGA_PAYLOAD:
       pararMotores();
       abrirCompuertaDescarga();
+      Serial.printf("-> Rutina completa en %.1f s. Pelotas capturadas: %d\n",
+                    (millis() - tiempoInicioMision) / 1000.0f, pelotasCapturadas);
       cambiarEstado(FIN_MISION, true);
       break;
+
+    // ---------- CALIBRACIÓN DE DISTANCIA (PRUEBA_GIRO, 'a') ----------
+    case CALIB_AVANCE: {
+      if (!estadoIniciado) {
+        estadoIniciado = true;
+        refAvance = odoAvance;
+        rumboObjetivo = odoRumbo;
+        Serial.printf("-> Avanzando %ld pulsos en línea recta...\n", PULSOS_CALIBRACION_AVANCE);
+      }
+      float avanzado = odoAvance - refAvance;
+      if (avanzado >= PULSOS_CALIBRACION_AVANCE ||
+          millis() - tiempoInicioEstado > 8000) {
+        pararMotores();
+        Serial.printf("-> Avance: %.0f pulsos | desvío de rumbo: %+.1f°\n",
+                      avanzado, pulsosAGrados(odoRumbo - rumboObjetivo));
+        Serial.println("   Mide la distancia recorrida en cm: pulsosPorCm = pulsos / cm");
+        cambiarEstado(FIN_MISION, true);
+        break;
+      }
+      moverOmni(0, VELOCIDAD_BASE, correccionRumbo());
+      break;
+    }
 
     case FIN_MISION:
     case ESTADO_ERROR:

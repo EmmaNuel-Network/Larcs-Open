@@ -1,28 +1,27 @@
 // ==========================================
-// PESTAÑA: Ultrasonidos.ino (Secuencial No Bloqueante)
+// PESTAÑA: Ultrasonidos.ino (2 Triggers Independientes)
 // ==========================================
 #include <Arduino.h>
 
-// 1. ASIGNACIÓN DE PINES EN ESP32
-const int pinTrigUnificado   = 18; // Trigger compartido
+// 1. ASIGNACIÓN DE PINES EN ESP32 (2 Sensores Independientes)
+const int pinTrigAlto        = 18; // Trigger Sensor Alto
+const int pinEchoAlto        = 23; // Echo Sensor Alto
 
-const int pinEchoFrontalBajo = 19; // Sensor Frontal Bajo
-const int pinEchoAlto        = 23; // Sensor Alto (Detección de frutos)
-const int pinEchoLateral     = 32; // Sensor Lateral (Bordes/Paredes)
+const int pinTrigLateral     = 25; // Trigger Sensor Lateral
+const int pinEchoLateral     = 26; // Echo Sensor Lateral
 
 // 2. CONFIGURACIÓN Y CONSTANTES DE DISTANCIA
 const int DISTANCIA_DESEADA_PARED = 15; // cm objetivo a la pared
 
 // Temporización secuencial para eliminar ecos fantasma sin bloquear
 unsigned long ultimoDisparoUS = 0;
-const unsigned long INTERVALO_ENTRE_SENSORES_MS = 35; // 35 ms de "descanso" entre cada disparador
+const unsigned long INTERVALO_ENTRE_SENSORES_MS = 35; // 35 ms entre cada disparo
 
 // Caché de distancias para el Orquestador
-int distCacheFrontalBajo = 999;
-int distCacheAlto        = 999;
-int distCacheLateral     = 999;
+int distCacheAlto    = 999;
+int distCacheLateral = 999;
 
-// Índice de la máquina de estados interna
+// Índice de la máquina de estados interna (0 = Alto, 1 = Lateral)
 int sensorActualMuestreo = 0; 
 
 // 3. PARÁMETROS DEL CONTROL PD DE PARED
@@ -34,15 +33,17 @@ unsigned long ultimoTiempoUltrasonido = 0;
 
 // 4. INICIALIZACIÓN DE PINES
 void setupUltrasonidos() {
-  pinMode(pinTrigUnificado, OUTPUT);
-  pinMode(pinEchoFrontalBajo, INPUT);
+  pinMode(pinTrigAlto, OUTPUT);
   pinMode(pinEchoAlto, INPUT);
+
+  pinMode(pinTrigLateral, OUTPUT);
   pinMode(pinEchoLateral, INPUT);
 
-  digitalWrite(pinTrigUnificado, LOW);
+  digitalWrite(pinTrigAlto, LOW);
+  digitalWrite(pinTrigLateral, LOW);
 }
 
-// 5. LECTURA BASE CON TIMEOUT SEGURO (Max ~80 cm / 4500 us)
+// 5. LECTURA BASE CON TIMEOUT SEGURO (Max ~2.5 metros)
 int medirSensorDirecto(int pinTrig, int pinEcho) {
   digitalWrite(pinTrig, LOW);
   delayMicroseconds(2);
@@ -50,17 +51,11 @@ int medirSensorDirecto(int pinTrig, int pinEcho) {
   delayMicroseconds(10);
   digitalWrite(pinTrig, LOW);
 
-  // Timeout ajustado a 15000 us (~2.5 metros máximo)
-  long duracion = pulseIn(pinEcho, HIGH, 15000); 
+  long duracion = pulseIn(pinEcho, HIGH, 15000); // 15ms timeout (~2.5 m)
 
-  // Si no hay respuesta o la lectura es 0, asigna fuera de rango (999)
-  if (duracion == 0) {
-    return 999; 
-  }
+  if (duracion == 0) return 999; 
 
   int distancia = (int)(duracion * 0.034 / 2);
-  
-  // Evita falsos positivos por lecturas en 0
   if (distancia <= 0) return 999; 
 
   return distancia;
@@ -70,35 +65,24 @@ int medirSensorDirecto(int pinTrig, int pinEcho) {
 void actualizarLecturasUltrasonido() {
   unsigned long tiempoActual = millis();
 
-  // Cambia de sensor cada 35 ms sin usar delay()
   if (tiempoActual - ultimoDisparoUS >= INTERVALO_ENTRE_SENSORES_MS) {
     ultimoDisparoUS = tiempoActual;
 
     switch (sensorActualMuestreo) {
       case 0:
-        distCacheFrontalBajo = medirSensorDirecto(pinTrigUnificado, pinEchoFrontalBajo);
+        distCacheAlto = medirSensorDirecto(pinTrigAlto, pinEchoAlto);
         sensorActualMuestreo = 1;
         break;
 
       case 1:
-        distCacheAlto = medirSensorDirecto(pinTrigUnificado, pinEchoAlto);
-        sensorActualMuestreo = 2;
-        break;
-
-      case 2:
-        distCacheLateral = medirSensorDirecto(pinTrigUnificado, pinEchoLateral);
-        sensorActualMuestreo = 0; // Reinicia el ciclo
+        distCacheLateral = medirSensorDirecto(pinTrigLateral, pinEchoLateral);
+        sensorActualMuestreo = 0; // Vuelve al primer sensor
         break;
     }
   }
 }
 
 // 7. FUNCIONES UTILIZADAS POR LA FSM PRINCIPAL (Retornan caché rápida)
-int leerUltrasonidoFrontalBajo() {
-  actualizarLecturasUltrasonido();
-  return distCacheFrontalBajo;
-}
-
 int leerUltrasonidoAlto() {
   actualizarLecturasUltrasonido();
   return distCacheAlto;

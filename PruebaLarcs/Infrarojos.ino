@@ -1,18 +1,22 @@
 // ==========================================
-// PESTAÑA: Infrarrojos.ino (3 QTR-8A: 3 Frontales PD + 2 Laterales Margen)
+// PESTAÑA: Infrarojos.ino (2 Frontales + 2 Laterales, todos en el MCP)
 // ==========================================
 #include <Arduino.h>
 #include <Adafruit_MCP23X17.h>
 
 extern Adafruit_MCP23X17 mcp;
 
-// 1. ASIGNACIÓN DE PINES EN MCP23017
-const int pinIR_Front_Centro = 8;  // PB0 (D4)
-const int pinIR_Front_Izq    = 9;  // PB1 (D2)
-const int pinIR_Front_Der    = 10; // PB2 (D3)
+// 1. ASIGNACIÓN DE PINES EN MCP23017 (Puerto B: 8 a 15)
+// Si los frontales quedan cruzados (pos sale al revés), intercambiar 8 y 9.
+const int pinIR_Front_Der = 8;  // PB0
+const int pinIR_Front_Izq = 9;  // PB1
+const int pinIR_Lat_Izq   = 10; // PB2
+const int pinIR_Lat_Der   = 11; // PB3
+// PB4 queda libre para el paso a paso.
 
-const int pinIR_Lat_Izq      = 11; // PB3 (D1 Izq)
-const int pinIR_Lat_Der      = 0;  // PA0 / GPIO0 (D1 Der)
+// Valor que entrega el sensor sobre NEGRO.
+// Si en PRUEBA_SENSORES ven 1 sobre blanco y 0 sobre negro, cambiar a LOW.
+const int IR_VALOR_NEGRO = HIGH;
 
 // 2. PARÁMETROS DEL CONTROL PD DE LÍNEA
 float Kp_Linea = 50.0f;  // Proporcional
@@ -22,45 +26,32 @@ float errorAnteriorLinea = 0.0f;
 unsigned long ultimoTiempoIR = 0;
 bool lineaPerdidaPrevia = true; // Previene picos derivativos al recuperar la línea
 
+// Lectura normalizada: 1 = negro, 0 = blanco (sin importar la lógica del módulo)
+int leerIR(int pin) {
+  return (mcp.digitalRead(pin) == IR_VALOR_NEGRO) ? 1 : 0;
+}
+
 // 3. INICIALIZACIÓN
 void setupInfrarrojos() {
-  mcp.pinMode(pinIR_Front_Centro, INPUT_PULLUP);
-  mcp.pinMode(pinIR_Front_Izq, INPUT_PULLUP);
   mcp.pinMode(pinIR_Front_Der, INPUT_PULLUP);
+  mcp.pinMode(pinIR_Front_Izq, INPUT_PULLUP);
   mcp.pinMode(pinIR_Lat_Izq, INPUT_PULLUP);
   mcp.pinMode(pinIR_Lat_Der, INPUT_PULLUP);
 }
 
-// 4. FUNCIONES DE LECTURA INDIVIDUAL (Añadidas para corregir el error de compilación)
-bool detectoLineaFrontalCentro() {
-  return (mcp.digitalRead(pinIR_Front_Centro) == HIGH);
-}
-
-bool detectoLineaFrontalIzq() {
-  return (mcp.digitalRead(pinIR_Front_Izq) == HIGH);
-}
-
-bool detectoLineaFrontalDer() {
-  return (mcp.digitalRead(pinIR_Front_Der) == HIGH);
-}
-
-// 5. CÁLCULO DE ERROR PONDERADO (3 Sensores Frontales)
+// 4. POSICIÓN DE LA LÍNEA CON 2 SENSORES FRONTALES
+// -1 = línea bajo el izquierdo, 0 = bajo ambos, +1 = bajo el derecho, 999 = sin línea
 float calcularErrorLinea() {
-  int s1 = mcp.digitalRead(pinIR_Front_Izq);
-  int s2 = mcp.digitalRead(pinIR_Front_Centro);
-  int s3 = mcp.digitalRead(pinIR_Front_Der);
+  int sIzq = leerIR(pinIR_Front_Izq);
+  int sDer = leerIR(pinIR_Front_Der);
 
-  int sumaLecturas = s1 + s2 + s3;
+  int suma = sIzq + sDer;
+  if (suma == 0) return 999.0f;
 
-  if (sumaLecturas == 0) {
-    return 999.0f; 
-  }
-
-  float posicionLinea = (float)(-1 * s1 + 0 * s2 + 1 * s3) / (float)sumaLecturas;
-  return posicionLinea;
+  return (float)(sDer - sIzq) / (float)suma;
 }
 
-// 6. CONTROL PD DE ALINEACIÓN FRONTAL
+// 5. CONTROL PD DE ALINEACIÓN FRONTAL
 int obtenerCorreccionLineaPD() {
   float errorActual = calcularErrorLinea();
   unsigned long tiempoActual = millis();
@@ -68,7 +59,7 @@ int obtenerCorreccionLineaPD() {
   if (errorActual >= 999.0f) {
     ultimoTiempoIR = tiempoActual;
     lineaPerdidaPrevia = true;
-    return (errorAnteriorLinea > 0) ? 40 : -40; 
+    return (errorAnteriorLinea > 0) ? 40 : -40;
   }
 
   float dt = (tiempoActual - ultimoTiempoIR) / 1000.0f;
@@ -84,19 +75,22 @@ int obtenerCorreccionLineaPD() {
   errorAnteriorLinea = errorActual;
 
   float salidaPD = (Kp_Linea * errorActual) + (Kd_Linea * derivativa);
-
   return (int)constrain(salidaPD, -120.0f, 120.0f);
 }
 
-// 7. DETECCIÓN DE MÁRGENES Y BORDES LATERALES
+// 6. DETECCIÓN DE MÁRGENES Y LÍNEA FRONTAL
 bool detectoMargenIzquierdo() {
-  return (mcp.digitalRead(pinIR_Lat_Izq) == HIGH);
+  return leerIR(pinIR_Lat_Izq) == 1;
 }
 
 bool detectoMargenDerecho() {
-  return (mcp.digitalRead(pinIR_Lat_Der) == HIGH);
+  return leerIR(pinIR_Lat_Der) == 1;
 }
 
 bool estaSobreLineaFrontal() {
   return (calcularErrorLinea() < 999.0f);
 }
+
+// 7. PARA EL DIAGNÓSTICO (PRUEBA_SENSORES)
+int irFrontalIzq() { return leerIR(pinIR_Front_Izq); }
+int irFrontalDer() { return leerIR(pinIR_Front_Der); }
