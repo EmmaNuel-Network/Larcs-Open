@@ -1,5 +1,5 @@
 // ==========================================
-// PESTAÑA PRINCIPAL: Robot-Larc.ino
+// PESTAÑA PRINCIPAL: PruebaLarcs.ino
 // FSM única + modos de prueba incrementales
 // Integra la lógica probada de PruebaIntegracionUltrasonidos.ino
 // ==========================================
@@ -28,6 +28,7 @@ enum EstadoFSM {
   IR_A_CULTIVO,
   ESQUIVAR_PISCINA,
   VERIFICAR_LIBERACION,   // Viene de la prueba funcional
+  ESCUADRAR,
   HOMING_Y_ESCUADRADO,
   RECOLECCION_MULTINIVEL,
   ALINEAR_Y_CAPTURAR,
@@ -41,13 +42,10 @@ enum EstadoFSM {
 // ==========================================
 // 2. MODOS DE PRUEBA
 // ==========================================
-// Cada modo define en qué estado arranca y qué estados tiene permitidos.
-// Si la FSM intenta entrar a un estado no permitido, el robot se detiene
-// (FIN_MISION) y lo reporta por Serial.
 enum ModoPrueba {
   PRUEBA_SENSORES,      // Robot quieto: imprime IR y ultrasonidos cada 200 ms
   PRUEBA_ESQUIVA,       // Idéntico a PruebaIntegracionUltrasonidos (sin IR)
-  PRUEBA_IR_A_CULTIVO,  // Esquiva + se detiene al ver la línea del cultivo
+  PRUEBA_IR_A_CULTIVO,  // Salida (ignora 1ra línea) -> Esquiva -> Línea cultivo -> Escuadra -> Homing
   PRUEBA_HOMING,        // Arranca en homing (poner el robot sobre la línea)
   PRUEBA_RECOLECCION,   // Arranca en recolección (poner el robot frente al árbol)
   PRUEBA_REGRESO,       // Arranca en regreso + descarga
@@ -57,7 +55,7 @@ enum ModoPrueba {
 };
 
 // >>>>>>>>>> CAMBIAR AQUÍ EL MODO Y VOLVER A SUBIR <<<<<<<<<<
-const ModoPrueba MODO = PRUEBA_DEMO;
+const ModoPrueba MODO = PRUEBA_IR_A_CULTIVO;
 
 // Subsistemas que se activan según el modo
 const bool LEER_IR        = (MODO != PRUEBA_ESQUIVA && MODO != PRUEBA_DEMO &&
@@ -81,19 +79,31 @@ int nivelActualH             = 1;
 // ==========================================
 // 4. PARÁMETROS DE NAVEGACIÓN (valores de la prueba funcional)
 // ==========================================
-const int VELOCIDAD_BASE                    = 120;
-const int UMBRAL_PISCINA_CM                 = 20;   // Detecta obstáculo
-const int UMBRAL_LIBRE_CM                   = 35;   // Considera frente despejado
+const int VELOCIDAD_BASE                      = 120;
+const int UMBRAL_PISCINA_CM                   = 20;   // Detecta obstáculo
+const int UMBRAL_LIBRE_CM                     = 35;   // Considera frente despejado
 const unsigned long TIEMPO_CONFIRMAR_LIBRE_MS = 800;
-const unsigned long VENTANA_IGNORAR_LINEA_MS  = 1500; // Evita leer líneas de la zona de salida (calibrar)
+const unsigned long VENTANA_IGNORAR_LINEA_MS  = 1500; // Tiempo mínimo absoluto al salir
+const unsigned long TIEMPO_BLANCO_TRAS_SALIDA_MS = 350;
+const unsigned long TIEMPO_ARMADO_RESPALDO_MS    = 3500;
+
+// --- Escuadrado y Homing ---
+const int V_LENTO                             = 60;
+const int W_ESCUADRE                          = 65;
+const int SIGNO_ESCUADRE                      = 1;
+const int LECTURAS_CONFIRMAR_ESCUADRE         = 2;
+const unsigned long PAUSA_FRENO_LINEA_MS      = 120;
+const unsigned long TIEMPO_INVERTIR_GIRO_ESCUADRE_MS = 450;
+const unsigned long TIMEOUT_ESCUADRE_MS       = 3500;
+const int V_HOMING                            = 110;
+const int LECTURAS_CONFIRMAR_MARGEN           = 2;
+const unsigned long VENTANA_INICIO_HOMING_MS  = 250;
 
 // --- Parámetros de PRUEBA_DEMO y PRUEBA_GIRO ---
 const int pinTrackLinea              = 8;    // MCP PB0: módulo track con comparador
-// Al encender, el robot debe estar sobre BLANCO: lee el módulo y asume que
-// ese valor es blanco y el contrario es negro. Así no importa la lógica del módulo.
 const bool AUTO_CALIBRAR_TRACK       = true;
 int trackValorNegro                  = HIGH; // Se sobrescribe si AUTO_CALIBRAR_TRACK = true
-const int LECTURAS_CONFIRMAR_LINEA   = 3;    // Lecturas seguidas en negro para aceptar la línea
+const int LECTURAS_CONFIRMAR_LINEA   = 2;    // Lecturas seguidas en negro para aceptar la línea
 
 const int VELOCIDAD_GIRO_DEMO        = 150;
 const long PULSOS_GIRO_180           = 600;  // CALIBRAR con PRUEBA_GIRO y escribir aquí el valor
@@ -105,7 +115,7 @@ const unsigned long TIMEOUT_GIRO_MS  = 4000; // Seguridad si los encoders no cue
 // solo el frontal iniciará la esquiva.
 const bool USAR_LATERAL_EN_DETECCION = true;
 
-const unsigned long TIMEOUT_HOMING  = 7000;
+const unsigned long TIMEOUT_HOMING  = 8000;
 const unsigned long TIMEOUT_CAPTURA = 4000;
 const unsigned long WATCHDOG_CAMARA = 800;
 
@@ -116,6 +126,19 @@ unsigned long tiempoInicioMision = 0;
 unsigned long tiempoInicioEstado = 0;
 unsigned long tiempoArmadoLinea  = 0; // Desde aquí corre la ventana de ignorar línea
 int contadorLinea                = 0;
+int contadorEscuadre             = 0;
+int contadorMargen               = 0;
+int etapaSalidaLinea             = 0; // 0=dentro, 1=cruzando 1ra línea, 2=armado
+unsigned long ultimoNegroSalida  = 0;
+
+bool izqAlDetectar               = false;
+bool derAlDetectar               = false;
+bool vioIzqEscuadre              = false;
+bool vioDerEscuadre              = false;
+int  dirGiroEscuadre             = 1;
+unsigned long ultimoVistoEscuadre = 0;
+bool giroEscuadreInvertido       = false;
+
 int trackCrudo                   = 0; // Última lectura de PB0 (para el monitor)
 unsigned long inicioGiro         = 0;
 unsigned long ultimoMonitorDemo  = 0;
@@ -165,6 +188,7 @@ const char* nombreEstado(EstadoFSM e) {
     case IR_A_CULTIVO:           return "IR_A_CULTIVO";
     case ESQUIVAR_PISCINA:       return "ESQUIVAR_PISCINA";
     case VERIFICAR_LIBERACION:   return "VERIFICAR_LIBERACION";
+    case ESCUADRAR:              return "ESCUADRAR";
     case HOMING_Y_ESCUADRADO:    return "HOMING_Y_ESCUADRADO";
     case RECOLECCION_MULTINIVEL: return "RECOLECCION_MULTINIVEL";
     case ALINEAR_Y_CAPTURAR:     return "ALINEAR_Y_CAPTURAR";
@@ -182,7 +206,7 @@ EstadoFSM estadoInicial() {
     case PRUEBA_SENSORES:     return FIN_MISION; // No se mueve
     case PRUEBA_ESQUIVA:
     case PRUEBA_IR_A_CULTIVO: return IR_A_CULTIVO;
-    case PRUEBA_HOMING:       return HOMING_Y_ESCUADRADO;
+    case PRUEBA_HOMING:       return ESCUADRAR;
     case PRUEBA_RECOLECCION:  return RECOLECCION_MULTINIVEL;
     case PRUEBA_REGRESO:      return REGRESO_BENEFICIADERO;
     case PRUEBA_DEMO:         return IR_A_CULTIVO;
@@ -199,10 +223,12 @@ bool estadoPermitido(EstadoFSM e) {
     case PRUEBA_SENSORES:
       return false;
     case PRUEBA_ESQUIVA:
-    case PRUEBA_IR_A_CULTIVO:
       return (e == IR_A_CULTIVO || e == ESQUIVAR_PISCINA || e == VERIFICAR_LIBERACION);
+    case PRUEBA_IR_A_CULTIVO:
+      return (e == IR_A_CULTIVO || e == ESQUIVAR_PISCINA || e == VERIFICAR_LIBERACION ||
+              e == ESCUADRAR || e == HOMING_Y_ESCUADRADO);
     case PRUEBA_HOMING:
-      return (e == HOMING_Y_ESCUADRADO);
+      return (e == ESCUADRAR || e == HOMING_Y_ESCUADRADO);
     case PRUEBA_RECOLECCION:
       return (e == RECOLECCION_MULTINIVEL || e == ALINEAR_Y_CAPTURAR);
     case PRUEBA_REGRESO:
@@ -218,14 +244,12 @@ bool estadoPermitido(EstadoFSM e) {
   return false;
 }
 
-// A dónde ir al detectar la línea: en la demo se da media vuelta,
-// en los demás modos se pasa al homing.
 EstadoFSM estadoAlDetectarLinea() {
-  return (MODO == PRUEBA_DEMO) ? GIRO_180 : HOMING_Y_ESCUADRADO;
+  izqAlDetectar = (irFrontalIzq() == 1);
+  derAlDetectar = (irFrontalDer() == 1);
+  return (MODO == PRUEBA_DEMO) ? GIRO_180 : ESCUADRAR;
 }
 
-// parar = true detiene motores al cambiar (como hacía la prueba en los
-// cambios AVANZAR->ESQUIVAR y VERIFICAR->AVANZAR); false mantiene el movimiento.
 void cambiarEstado(EstadoFSM nuevoEstado, bool parar) {
   if (nuevoEstado == estadoActual) return;
 
@@ -255,7 +279,7 @@ void moverElevadorANivel(int nivel) {
   if (nivel == nivelActualH) return;
 
   mcp.digitalWrite(pinDirElevador, (nivel > nivelActualH) ? HIGH : LOW);
-  int pasos = abs(nivel - nivelActualH) * 400; // TODO: calcular con el piñón real
+  int pasos = abs(nivel - nivelActualH) * 400;
 
   for (int i = 0; i < pasos; i++) {
     mcp.digitalWrite(pinStepElevador, HIGH);
@@ -312,9 +336,6 @@ void procesarCamaraVision() {
 // ==========================================
 // 9b. DIAGNÓSTICO DE SENSORES (solo PRUEBA_SENSORES)
 // ==========================================
-// Mapeo (Infrarojos.ino): PB0 = frontal der, PB1 = frontal izq,
-//                         PB2 = lateral izq, PB3 = lateral der
-// Muestra el valor CRUDO de cada pin y la interpretación del módulo (1 = negro).
 const unsigned long INTERVALO_DIAGNOSTICO_MS = 200;
 unsigned long ultimoDiagnostico = 0;
 
@@ -328,7 +349,7 @@ void imprimirDiagnosticoSensores(int distFrontal, int distLateral) {
   int rawPB2 = (puertoB >> 2) & 1;
   int rawPB3 = (puertoB >> 3) & 1;
 
-  float posLinea = calcularErrorLinea(); // -1 izq, 0 ambos, +1 der, 999 sin línea
+  float posLinea = calcularErrorLinea();
 
   Serial.printf("CRUDO FrIzq(PB1)=%d FrDer(PB0)=%d LatIzq(PB2)=%d LatDer(PB3)=%d",
                 rawPB1, rawPB0, rawPB2, rawPB3);
@@ -343,9 +364,6 @@ void imprimirDiagnosticoSensores(int distFrontal, int distLateral) {
 // ==========================================
 // 9c. COMANDOS SERIAL, MONITOR DE DEMO Y AUTOCALIBRACIÓN DEL TRACK
 // ==========================================
-// 'g' = girar 180° (solo PRUEBA_GIRO, con el robot quieto)
-// '+' / '-' = sumar / restar 100 pulsos al giro
-// '>' / '<' = sumar / restar 20 pulsos al giro
 void procesarComandosSerial() {
   while (Serial.available() > 0) {
     char c = Serial.read();
@@ -389,11 +407,10 @@ void autocalibrarTrack() {
 // ==========================================
 void setup() {
   Serial.begin(115200);
-  // RX 16 = ESP32-CAM. TX en 19 (libre desde que se quitó el eco frontal bajo).
-  // No usar 26: ahora es el eco del ultrasonido lateral.
   Serial2.begin(115200, SERIAL_8N1, 16, 19);
 
   Wire.begin(21, 22);
+  Wire.setClock(400000);
   if (!mcp.begin_I2C()) {
     Serial.println("Error al iniciar MCP23017");
     while (1);
@@ -410,8 +427,6 @@ void setup() {
     mcp.pinMode(pinDirElevador, OUTPUT);
   }
 
-  // El servo solo se activa cuando se necesita: ESP32Servo y analogWrite
-  // comparten temporizadores LEDC y así no afecta las pruebas de navegación.
   if (USAR_SERVO) {
     servoCompuerta.attach(pinServoCompuerta);
     servoCompuerta.write(0);
@@ -438,11 +453,13 @@ void setup() {
     Serial.println("--- MODO SENSORES: robot quieto, diagnóstico cada 200 ms ---");
     Serial.println("Esperado: 1 = negro, 0 = blanco. Ultrasonidos en cm (999 = sin eco).");
   } else {
-    delay(2000); // Pausa de seguridad (igual que la prueba)
+    delay(2000); // Pausa de seguridad
     estadoActual = estadoInicial();
     tiempoInicioMision = millis();
     tiempoInicioEstado = millis();
     tiempoArmadoLinea  = millis();
+    etapaSalidaLinea   = (estadoActual == IR_A_CULTIVO) ? 0 : 2;
+    ultimoNegroSalida  = millis();
     Serial.printf("--- MODO PRUEBA: arranca en %s ---\n", nombreEstado(estadoActual));
   }
 }
@@ -453,7 +470,11 @@ void setup() {
 void loop() {
   procesarComandosSerial();
   actualizarControlMotores();
-  actualizarLecturasUltrasonido();
+
+  bool usarUltrasonidoAhora = (estadoActual != ESCUADRAR && estadoActual != HOMING_Y_ESCUADRADO);
+  if (usarUltrasonidoAhora || MODO == PRUEBA_SENSORES) {
+    actualizarLecturasUltrasonido();
+  }
   procesarCamaraVision();
 
   if (millis() - ultimaLecturaCamara > WATCHDOG_CAMARA) {
@@ -463,34 +484,61 @@ void loop() {
   }
 
   // --- Ultrasonidos (misma lógica que la prueba funcional) ---
-  int distFrontal = leerUltrasonidoAlto();
-  int distLateral = leerUltrasonidoLateral();
+  int distFrontal = usarUltrasonidoAhora ? leerUltrasonidoAlto()    : 999;
+  int distLateral = usarUltrasonidoAhora ? leerUltrasonidoLateral() : 999;
 
   int distParedEfectiva = 999;
   if (distFrontal < 999 && distLateral < 999) distParedEfectiva = min(distFrontal, distLateral);
   else if (distFrontal < 999)                 distParedEfectiva = distFrontal;
   else if (distLateral < 999)                 distParedEfectiva = distLateral;
 
-  // --- Infrarrojos (solo si el modo los usa) ---
-  bool lineaFrontal = false, margenIzq = false, margenDer = false;
+  // --- Infrarrojos ---
+  bool lineaCruda = false, lineaFrontal = false, margenIzq = false, margenDer = false;
   if (LEER_IR) {
-    lineaFrontal = estaSobreLineaFrontal();
+    lineaCruda   = estaSobreLineaFrontal();
+    contadorLinea = lineaCruda ? min(contadorLinea + 1, 100) : 0;
+    lineaFrontal = (contadorLinea >= LECTURAS_CONFIRMAR_LINEA);
     margenIzq    = detectoMargenIzquierdo();
     margenDer    = detectoMargenDerecho();
   }
-  // Demo: la línea la detecta solo el módulo track en PB0, con confirmación
   if (MODO == PRUEBA_DEMO) {
-    trackCrudo = mcp.digitalRead(pinTrackLinea);
-    bool negro = (trackCrudo == trackValorNegro);
-    contadorLinea = negro ? min(contadorLinea + 1, 100) : 0;
-    lineaFrontal  = (contadorLinea >= LECTURAS_CONFIRMAR_LINEA);
+    trackCrudo   = mcp.digitalRead(pinTrackLinea);
+    lineaCruda   = (trackCrudo == trackValorNegro);
+    contadorLinea = lineaCruda ? min(contadorLinea + 1, 100) : 0;
+    lineaFrontal = (contadorLinea >= LECTURAS_CONFIRMAR_LINEA);
   }
 
-  bool lineaArmada = (millis() - tiempoArmadoLinea > VENTANA_IGNORAR_LINEA_MS);
+  // --- Gestión de salida del recuadro inicial (ignorar 1ra línea negra) ---
+  if (estadoActual == IR_A_CULTIVO || estadoActual == ESQUIVAR_PISCINA ||
+      estadoActual == VERIFICAR_LIBERACION) {
+    unsigned long tDesdeArmado = millis() - tiempoArmadoLinea;
+    if (etapaSalidaLinea == 0) {
+      if (lineaCruda) {
+        etapaSalidaLinea = 1;
+        ultimoNegroSalida = millis();
+        Serial.println("-> [SALIDA] 1ra línea negra detectada. Ignorando...");
+      } else if (tDesdeArmado > TIEMPO_ARMADO_RESPALDO_MS || estadoActual == ESQUIVAR_PISCINA) {
+        etapaSalidaLinea = 2;
+        Serial.println("-> [SALIDA] Zona inicial superada. Línea de cultivo ARMADA.");
+      }
+    } else if (etapaSalidaLinea == 1) {
+      if (lineaCruda) {
+        ultimoNegroSalida = millis();
+      } else if ((millis() - ultimoNegroSalida > TIEMPO_BLANCO_TRAS_SALIDA_MS) &&
+                 (tDesdeArmado > VENTANA_IGNORAR_LINEA_MS)) {
+        etapaSalidaLinea = 2;
+        contadorLinea = 0;
+        lineaFrontal = false;
+        Serial.println("-> [SALIDA] 1ra línea negra superada. Línea de cultivo ARMADA.");
+      }
+    }
+  }
+
+  bool lineaArmada = (etapaSalidaLinea >= 2) &&
+                     (millis() - tiempoArmadoLinea > VENTANA_IGNORAR_LINEA_MS);
 
   if (MODO == PRUEBA_DEMO) imprimirMonitorDemo(distFrontal, distLateral);
 
-  // Modo diagnóstico: solo imprime, la FSM no corre y los motores siguen en 0
   if (MODO == PRUEBA_SENSORES) {
     imprimirDiagnosticoSensores(distFrontal, distLateral);
     return;
@@ -505,6 +553,8 @@ void loop() {
       if (mcp.digitalRead(pinBotonStart) == LOW) {
         tiempoInicioMision = millis();
         tiempoArmadoLinea  = millis();
+        etapaSalidaLinea   = 0;
+        ultimoNegroSalida  = millis();
         cambiarEstado(IR_A_CULTIVO, true);
       }
       break;
@@ -513,7 +563,6 @@ void loop() {
     case IR_A_CULTIVO:
       moverOmni(0, VELOCIDAD_BASE, 0);
 
-      // Evalúa AMBOS sensores (igual que la prueba funcional)
       if ((distFrontal >= 3 && distFrontal < UMBRAL_PISCINA_CM) ||
           (USAR_LATERAL_EN_DETECCION && distLateral >= 3 && distLateral < UMBRAL_PISCINA_CM)) {
         Serial.printf("-> Obstáculo detectado. Frontal: %d cm | Lateral: %d cm. Iniciando esquiva...\n",
@@ -538,7 +587,6 @@ void loop() {
         Serial.println("-> Frente despejado. Verificando liberación...");
         cambiarEstado(VERIFICAR_LIBERACION, false);
       }
-      // TODO: timeout y cambio de dirección con márgenes IR (siempre esquiva a la derecha)
       break;
     }
 
@@ -563,7 +611,6 @@ void loop() {
 
     // ---------- GIRO 180° (solo PRUEBA_DEMO) ----------
     case GIRO_180: {
-      // Pausa corta: el robot frena antes de girar (motores ya en 0)
       if (millis() - tiempoInicioEstado < PAUSA_ANTES_GIRO_MS) break;
 
       if (!estadoIniciado) {
@@ -582,7 +629,8 @@ void loop() {
         Serial.printf("-> Giro terminado: %ld pulsos promedio en %lu ms%s\n",
                       avance, millis() - inicioGiro,
                       porTimeout ? "  (TIMEOUT: revisar encoders)" : "");
-        tiempoArmadoLinea = millis(); // Ignora la línea un momento al salir
+        tiempoArmadoLinea = millis();
+        etapaSalidaLinea = 2;
         contadorLinea = 0;
         if (MODO == PRUEBA_GIRO) {
           Serial.println("   ¿Quedó a 180°? Ajusta con '+'/'-' y vuelve a enviar 'g'.");
@@ -596,26 +644,104 @@ void loop() {
       break;
     }
 
-    // ---------- HOMING (esqueleto) ----------
-    case HOMING_Y_ESCUADRADO:
-      // TODO: escuadrado con los IR frontales antes del strafe
-      if (margenIzq || millis() - tiempoInicioEstado > TIMEOUT_HOMING) {
-        if (!margenIzq) Serial.println("[HOMING] Timeout sin ver margen izquierdo");
+    // ---------- ESCUADRADO EN LÍNEA FRONTAL ----------
+    case ESCUADRAR: {
+      int izq = irFrontalIzq();
+      int der = irFrontalDer();
+
+      if (!estadoIniciado) {
+        estadoIniciado = true;
+        contadorEscuadre = 0;
+        vioIzqEscuadre = izqAlDetectar || (izq == 1);
+        vioDerEscuadre = derAlDetectar || (der == 1);
+        giroEscuadreInvertido = false;
+        ultimoVistoEscuadre = millis();
+
+        if (vioIzqEscuadre && !vioDerEscuadre)      dirGiroEscuadre =  SIGNO_ESCUADRE;
+        else if (!vioIzqEscuadre && vioDerEscuadre) dirGiroEscuadre = -SIGNO_ESCUADRE;
+        else                                        dirGiroEscuadre =  0;
+      }
+
+      if (izq) { vioIzqEscuadre = true; ultimoVistoEscuadre = millis(); }
+      if (der) { vioDerEscuadre = true; ultimoVistoEscuadre = millis(); }
+
+      if (millis() - tiempoInicioEstado < PAUSA_FRENO_LINEA_MS) {
+        pararMotores();
+        break;
+      }
+
+      if ((izq && der) || (vioIzqEscuadre && vioDerEscuadre)) {
+        contadorEscuadre++;
+        pararMotores();
+      } else {
+        contadorEscuadre = 0;
+        if (izq && !der) {
+          dirGiroEscuadre = SIGNO_ESCUADRE * (giroEscuadreInvertido ? -1 : 1);
+          moverOmni(0, 0, dirGiroEscuadre * W_ESCUADRE);
+        } else if (!izq && der) {
+          dirGiroEscuadre = -SIGNO_ESCUADRE * (giroEscuadreInvertido ? -1 : 1);
+          moverOmni(0, 0, dirGiroEscuadre * W_ESCUADRE);
+        } else {
+          if (millis() - ultimoVistoEscuadre > TIEMPO_INVERTIR_GIRO_ESCUADRE_MS && !giroEscuadreInvertido) {
+            giroEscuadreInvertido = true;
+            dirGiroEscuadre = -dirGiroEscuadre;
+            ultimoVistoEscuadre = millis();
+          }
+          if (dirGiroEscuadre != 0) {
+            moverOmni(0, -V_LENTO / 2, dirGiroEscuadre * W_ESCUADRE);
+          } else {
+            moverOmni(0, -V_LENTO, 0);
+          }
+        }
+      }
+
+      bool listo = (contadorEscuadre >= LECTURAS_CONFIRMAR_ESCUADRE);
+      bool porTimeout = (millis() - tiempoInicioEstado > TIMEOUT_ESCUADRE_MS);
+      if (listo || porTimeout) {
+        pararMotores();
+        delay(150);
+        Serial.printf("-> Escuadrado %s.\n", listo ? "OK" : "por TIMEOUT");
+        cambiarEstado(HOMING_Y_ESCUADRADO, true);
+      }
+      break;
+    }
+
+    // ---------- HOMING AL MARGEN IZQUIERDO ----------
+    case HOMING_Y_ESCUADRADO: {
+      if (!estadoIniciado) {
+        estadoIniciado = true;
+        contadorMargen = 0;
+      }
+
+      unsigned long tEnHoming = millis() - tiempoInicioEstado;
+      bool vioMargen = false;
+      if (tEnHoming > VENTANA_INICIO_HOMING_MS) {
+        vioMargen = margenIzq || (tEnHoming > 800 && margenDer);
+      }
+      contadorMargen = vioMargen ? contadorMargen + 1 : 0;
+
+      bool listo = (contadorMargen >= LECTURAS_CONFIRMAR_MARGEN);
+      bool porTimeout = (tEnHoming > TIMEOUT_HOMING);
+
+      if (listo || porTimeout) {
+        pararMotores();
+        Serial.printf("-> Homing %s. Encuadre completado.\n", listo ? "OK" : "por TIMEOUT");
         resetEncoders();
         if (estadoPermitido(RECOLECCION_MULTINIVEL)) {
           moverElevadorANivel(1);
           direccionBarrido = 1;
+          cambiarEstado(RECOLECCION_MULTINIVEL, true);
+        } else {
+          cambiarEstado(FIN_MISION, true);
         }
-        cambiarEstado(RECOLECCION_MULTINIVEL, true);
         break;
       }
-      moverOmni(-150, 0, 0);
+      moverOmni(-V_HOMING, 0, 0);
       break;
+    }
 
     // ---------- RECOLECCIÓN (esqueleto) ----------
     case RECOLECCION_MULTINIVEL:
-      // TODO: el árbol sigue al frente después de capturar, así que esta
-      // condición vuelve a disparar de inmediato. Definir el disparo con la cámara.
       if (distFrontal >= 3 && distFrontal < 25) {
         cambiarEstado(ALINEAR_Y_CAPTURAR, true);
         break;
@@ -652,9 +778,6 @@ void loop() {
 
     // ---------- REGRESO Y DESCARGA (esqueleto) ----------
     case REGRESO_BENEFICIADERO:
-      // TODO: al entrar, el IR frontal puede seguir sobre la línea del cultivo
-      // -> agregar ventana de ignorar línea desde la entrada al estado.
-      // TODO: en reversa los ultrasonidos apuntan al lado contrario.
       if (lineaFrontal) {
         cambiarEstado(DESCARGA_PAYLOAD, true);
         break;

@@ -23,6 +23,14 @@ struct ControlPD {
   int outputPWM = 0;
 };
 
+// Tipo para el filtro de tiempo de los sensores infrarrojos (Infrarojos.ino)
+struct FiltroTiempoIR {
+  bool enNegroCrudo = false;
+  unsigned long inicioNegroMs = 0;
+  unsigned long ultimoConfirmadoMs = 0;
+  bool confirmado = false;
+};
+
 // ==========================================
 // 1. ESTADOS DE LA FSM
 // ==========================================
@@ -70,7 +78,7 @@ enum ModoPrueba {
 };
 
 // >>>>>>>>>> CAMBIAR AQUÍ EL MODO Y VOLVER A SUBIR <<<<<<<<<<
-const ModoPrueba MODO = PRUEBA_DEMO;
+const ModoPrueba MODO = PRUEBA_SENSORES;
 
 // Subsistemas según el modo
 const bool LEER_IR = (MODO != PRUEBA_ESQUIVA && MODO != PRUEBA_DEMO && MODO != PRUEBA_GIRO &&
@@ -119,15 +127,15 @@ const bool USAR_LATERAL_EN_DETECCION = true;
 // --- Arranque (sin botón) ---
 const unsigned long RETARDO_ARRANQUE_MS = 2000; // Tiempo entre encender y empezar a moverse
 
-// --- Línea ---
-const unsigned long VENTANA_IGNORAR_LINEA_MS = 1500; // Al arrancar y tras cada giro
-// La línea debe verse en negro de forma CONTINUA mientras el robot recorre
-// esta distancia. Filtra puntos y manchas del piso sin importar la velocidad.
-// La línea mide 1.9 cm: no subir de ~1.2. Subir si aún hay falsos disparos.
-const float LONGITUD_MIN_LINEA_CM = 0.8f;
+// --- Línea y salida de zona inicial ---
+const unsigned long VENTANA_IGNORAR_LINEA_MS     = 1800; // Tiempo mínimo absoluto al salir/girar
+const unsigned long TIEMPO_BLANCO_TRAS_SALIDA_MS = 400;  // Tiempo viendo blanco tras cruzar la 1ra línea
+const unsigned long TIEMPO_ARMADO_RESPALDO_MS    = 3500; // Si no vio 1ra línea en este tiempo, arma igual
+const int LECTURAS_CONFIRMAR_LINEA               = 2;
+const float LONGITUD_MIN_LINEA_CM                = 0.8f;
 
 // --- Control de rumbo (odometría de encoders) ---
-const bool  USAR_CONTROL_RUMBO = true;
+const bool  USAR_CONTROL_RUMBO = false;
 const float KP_RUMBO           = 4.0f;  // W por cada grado de error
 const int   W_MAX_RUMBO        = 60;
 
@@ -145,27 +153,29 @@ float pulsosPorCm                    = 25.0f; // CALIBRAR con PRUEBA_GIRO ('a')
 const long PULSOS_CALIBRACION_AVANCE = 1500;
 
 // --- Escuadrado ---
-const int V_LENTO                    = 60;   // Avance lento buscando la línea
-const int W_ESCUADRE                 = 60;
-const int SIGNO_ESCUADRE             = 1;    // Si al escuadrar se aleja de la línea, poner -1
-const int LECTURAS_CONFIRMAR_ESCUADRE = 3;
-const unsigned long TIMEOUT_ESCUADRE_MS = 4000;
+const int V_LENTO                      = 60;
+const int W_ESCUADRE                   = 65;   // Velocidad de giro para escuadrar
+const int SIGNO_ESCUADRE               = 1;
+const int LECTURAS_CONFIRMAR_ESCUADRE  = 2;
+const unsigned long PAUSA_FRENO_LINEA_MS = 150; // Deja asentar el frenado antes de corregir
+const unsigned long MAX_GIRO_ESCUADRE_MS = 600; // Tope máximo de corrección angular (nunca gira sin fin)
+const unsigned long TIMEOUT_ESCUADRE_MS  = 1200;
 
 // --- Homing y barrido ---
-const int V_HOMING                   = 100;
+const int V_HOMING                   = 110;
 const int V_BARRIDO                  = 100;
-const float KP_AVANCE                = 0.5f; // Mantiene la distancia a la línea al hacer strafe
+const float KP_AVANCE                = 0.5f;
 const int   MAX_CORRECCION_AVANCE    = 40;
 const int LECTURAS_CONFIRMAR_MARGEN  = 2;
+const unsigned long VENTANA_INICIO_HOMING_MS = 300; // Ignora lecturas residuales al iniciar el strafe
 const unsigned long TIMEOUT_HOMING_MS       = 8000;
 const unsigned long TIMEOUT_BARRIDO_NIVEL_MS = 12000;
 const unsigned long TIMEOUT_CENTRAR_MS       = 6000;
 const float TOLERANCIA_CENTRAR_CM            = 3.0f;
-// Si el robot pisa un margen mientras navega, se aleja de él con esta velocidad lateral
 const int V_REPELER_MARGEN                   = 60;
 const int NIVELES_BARRIDO            = 3;
-const int UMBRAL_ARBOL_CM            = 25;   // Ultrasonido frontal: a menos de esto hay un árbol
-const unsigned long TIEMPO_LIMITE_RECOLECCION_MS = 150000; // Corta el barrido y regresa
+const int UMBRAL_ARBOL_CM            = 25;
+const unsigned long TIEMPO_LIMITE_RECOLECCION_MS = 150000;
 
 // --- Descarga (AJUSTAR con la geometría real de la cancha) ---
 const int   LADO_RECIPIENTE              = -1;   // -1 = izquierda, +1 = derecha
@@ -219,14 +229,26 @@ unsigned long ultimoMonitor      = 0;
 unsigned long finGiroCalibracion = 0;  // PRUEBA_GIRO: para medir el giro ya detenido
 bool estadoIniciado              = false;
 
-// Filtro de negro por distancia: un sensor solo cuenta como "sobre línea"
-// si ve negro sin interrupción mientras el robot recorre LONGITUD_MIN_LINEA_CM.
 struct FiltroNegro {
   bool  viendo = false;
+  int   lecturas = 0;
   float desdeAvance = 0.0f;
   float desdeLateral = 0.0f;
 };
 FiltroNegro filtroLinea, filtroMargenIzq, filtroMargenDer;
+
+// Control de salida de la zona inicial (para ignorar la 1ra línea negra)
+// 0 = dentro del recuadro inicial (esperando cruzar 1ra línea)
+// 1 = cruzando la 1ra línea negra (esperando volver a piso blanco)
+// 2 = fuera del recuadro inicial -> línea del cultivo ARMADA
+int etapaSalidaLinea             = 0;
+unsigned long ultimoNegroSalida  = 0;
+
+// Variables para escuadrado acotado en la línea frontal
+long desfaseFrontalesMs          = 0;
+unsigned long duracionGiroEscuadreMs = 0;
+int  dirGiroEscuadre             = 0;
+
 int contadorEscuadre  = 0;
 int contadorMargen    = 0;
 int trackCrudo        = 0;
@@ -282,6 +304,8 @@ bool detectoMargenDerecho();
 float calcularErrorLinea();
 int irFrontalIzq();
 int irFrontalDer();
+long diferenciaTiempoFrontalesMs();
+void limpiarHistorialLineaFrontal();
 
 void setupElevador();
 void elevadorIrAMM(float objetivoMM);
@@ -306,9 +330,6 @@ int obtenerCorreccionParedPD(int distMedida);
 // ==========================================
 // 7. ODOMETRÍA Y CONTROL DE RUMBO
 // ==========================================
-// Cinemática de moverOmni:  v1 = Vy+Vx-W, v2 = Vy-Vx+W, v3 = Vy-Vx-W, v4 = Vy+Vx+W
-// Inversa:  avance = (d1+d2+d3+d4)/4, lateral = (d1-d2-d3+d4)/4, rumbo = (-d1+d2-d3+d4)/4
-// W > 0 hace crecer odoRumbo. 180° equivalen a pulsosGiro180.
 void leerEncoders(long p[4]) {
   p[0] = getPulsosM1(); p[1] = getPulsosM2();
   p[2] = getPulsosM3(); p[3] = getPulsosM4();
@@ -341,36 +362,42 @@ bool controlRumboActivo() {
   return USAR_CONTROL_RUMBO && MODO != PRUEBA_ESQUIVA;
 }
 
-// Corrección de giro para mantener rumboObjetivo
 int correccionRumbo() {
   if (!controlRumboActivo()) return 0;
   float errGrados = pulsosAGrados(rumboObjetivo - odoRumbo);
   return (int)constrain(KP_RUMBO * errGrados, (float)-W_MAX_RUMBO, (float)W_MAX_RUMBO);
 }
 
-// Corrección de avance para no alejarse de la línea al hacer strafe
 int correccionAvance() {
+  if (!controlRumboActivo()) return 0;
   float err = avanceObjetivo - odoAvance;
   return (int)constrain(KP_AVANCE * err, (float)-MAX_CORRECCION_AVANCE, (float)MAX_CORRECCION_AVANCE);
 }
 
-// Fija la referencia actual como "recto" y "a esta distancia de la línea"
 void fijarReferenciasAqui() {
   rumboObjetivo  = odoRumbo;
   avanceObjetivo = odoAvance;
 }
 
-// Devuelve true solo si el sensor lleva viendo negro LONGITUD_MIN_LINEA_CM
+// El filtrado por tiempo continuo (>= 25 ms) ya se realiza en Infrarojos.ino
 bool filtrarNegro(FiltroNegro &f, bool crudo) {
-  if (!crudo) { f.viendo = false; return false; }
-  if (!f.viendo) {
-    f.viendo = true;
-    f.desdeAvance  = odoAvance;
-    f.desdeLateral = odoLateral;
+  if (!crudo) {
+    f.viendo = false;
+    f.lecturas = 0;
+    return false;
   }
-  float recorridoCm = pulsosACm(fabs(odoAvance - f.desdeAvance) +
-                                fabs(odoLateral - f.desdeLateral));
-  return recorridoCm >= LONGITUD_MIN_LINEA_CM;
+  f.viendo = true;
+  if (f.lecturas < 100) f.lecturas++;
+  return f.lecturas >= 1;
+}
+
+void rearmarSalidaLinea(bool ignorarPrimeraLinea) {
+  tiempoArmadoLinea = millis();
+  filtroLinea.viendo = false;
+  filtroLinea.lecturas = 0;
+  limpiarHistorialLineaFrontal();
+  etapaSalidaLinea = ignorarPrimeraLinea ? 0 : 2;
+  ultimoNegroSalida = millis();
 }
 
 // ==========================================
@@ -482,6 +509,9 @@ void iniciarGiro180(EstadoFSM siguiente) {
 
 // Qué hacer al detectar la línea al frente
 void alDetectarLinea() {
+  desfaseFrontalesMs = diferenciaTiempoFrontalesMs();
+  Serial.printf("-> [LÍNEA] Línea frontal confirmada por AMBOS sensores (desfase=%ld ms)\n",
+                desfaseFrontalesMs);
   if (MODO == PRUEBA_DEMO) {
     iniciarGiro180(NAVEGAR);
   } else {
@@ -606,8 +636,6 @@ void procesarCamaraVision() {
 // ==========================================
 // 11. DIAGNÓSTICO, MONITOR Y COMANDOS SERIAL
 // ==========================================
-// Mapeo (Infrarojos.ino): PB0 = frontal der, PB1 = frontal izq,
-//                         PB2 = lateral izq, PB3 = lateral der
 const unsigned long INTERVALO_DIAGNOSTICO_MS = 200;
 unsigned long ultimoDiagnostico = 0;
 
@@ -638,12 +666,10 @@ void imprimirMonitor(int distFrontal, int distLateral, bool lineaCruda,
                      bool margenIzq, bool margenDer) {
   if (millis() - ultimoMonitor < 300) return;
   ultimoMonitor = millis();
-  Serial.printf("[MON] %-20s %s N%d | linea=%d mIzq=%d mDer=%d | US F=%3d L=%3d | rumbo=%+6.1f° av=%+6.1fcm lat=%+6.1fcm | elev=%3.0fmm cap=%d\n",
+  Serial.printf("[MON] %-20s %s E%d | linea=%d mIzq=%d | US F=%3d L=%3d\n",
                 nombreEstado(estadoActual), (fase == FASE_IDA) ? "IDA  " : "VUELTA",
-                nivelBarrido, lineaCruda ? 1 : 0, margenIzq ? 1 : 0, margenDer ? 1 : 0,
-                distFrontal, distLateral, rumboGrados(),
-                pulsosACm(odoAvance), pulsosACm(odoLateral),
-                posicionElevadorMM(), pelotasCapturadas);
+                etapaSalidaLinea, lineaCruda ? 1 : 0, margenIzq ? 1 : 0,
+                distFrontal, distLateral);
 }
 
 void imprimirMenuMecanismo() {
@@ -682,11 +708,6 @@ void comandoMecanismo(char c) {
                            posicionElevadorMM(), retardoPasoUs);
 }
 
-// Comandos por Serial según el modo:
-//  PRUEBA_GIRO:      'g' giro 180°, 'a' avance recto, '+'/'-' y '>'/'<' ajustan el giro
-//  PRUEBA_MECANISMO: ver imprimirMenuMecanismo()
-//  PRUEBA_CAPTURA:   'r' repetir la captura
-//  DECISION_SERIAL:  's' capturar / 'n' omitir la pelota actual
 void procesarComandosSerial() {
   while (Serial.available() > 0) {
     char c = Serial.read();
@@ -751,8 +772,6 @@ void setup() {
 
   if (LEER_IR) setupInfrarrojos();
 
-  // El elevador siempre se configura para dejar sus bobinas apagadas.
-  // Al encender, el elevador debe estar ABAJO (nivel 1): esa es la posición 0.
   setupElevador();
   if (USAR_SERVO) setupRecoleccion();
 
@@ -763,7 +782,6 @@ void setup() {
     else Serial.printf("[TRACK] Valor de negro fijo: %d\n", trackValorNegro);
   }
 
-  // En PRUEBA_REGRESO el robot arranca en la línea del cultivo, ya de vuelta
   if (MODO == PRUEBA_REGRESO) {
     fase = FASE_VUELTA;
     estadoTrasGiro = NAVEGAR;
@@ -784,21 +802,21 @@ void setup() {
     Serial.println("--- MODO SENSORES: robot quieto, diagnóstico cada 200 ms ---");
     Serial.println("Esperado: 1 = negro, 0 = blanco. Ultrasonidos en cm (999 = sin eco).");
   } else {
-    // PRUEBA_CAPTURA: el robot está frente a una pelota en el nivel elegido
     if (MODO == PRUEBA_CAPTURA) {
       nivelBarrido = NIVEL_PRUEBA_CAPTURA;
       moverElevadorANivel(NIVEL_PRUEBA_CAPTURA);
       Serial.println("--- PRUEBA CAPTURA: al terminar envía 'r' para repetir ---");
     }
-    // Sin botón: arranca sola después de encender el interruptor de control
     Serial.printf("--- Arranque en %lu ms ---\n", RETARDO_ARRANQUE_MS);
     delay(RETARDO_ARRANQUE_MS);
     iniciarOdometria();
     estadoActual = estadoInicial();
     tiempoInicioMision = millis();
     tiempoInicioEstado = millis();
-    tiempoArmadoLinea  = millis();
-    Serial.printf("--- MODO PRUEBA: arranca en %s ---\n", nombreEstado(estadoActual));
+    bool ignorarPrimera = (estadoActual == NAVEGAR && fase == FASE_IDA);
+    rearmarSalidaLinea(ignorarPrimera);
+    Serial.printf("--- MODO PRUEBA: arranca en %s (etapaSalidaLinea=%d) ---\n",
+                  nombreEstado(estadoActual), etapaSalidaLinea);
   }
 }
 
@@ -808,9 +826,16 @@ void setup() {
 void loop() {
   procesarComandosSerial();
   actualizarControlMotores();
-  actualizarLecturasUltrasonido();   // Puede bloquear hasta ~15 ms (pulseIn)
+
+  // Durante ESCUADRAR y HOMING_MARGEN no se dispara el ultrasonido (pulseIn bloquea
+  // hasta 15 ms) para que la lectura de los IR por I2C corra a máxima velocidad (>500 Hz).
+  bool usarUltrasonidoAhora = (estadoActual != ESCUADRAR && estadoActual != HOMING_MARGEN);
+  if (usarUltrasonidoAhora || MODO == PRUEBA_SENSORES) {
+    actualizarLecturasUltrasonido();
+  }
+
   procesarCamaraVision();
-  actualizarOdometria();             // Después del ultrasonido: odometría al día para la línea
+  actualizarOdometria();
 
   if (millis() - ultimaLecturaCamara > WATCHDOG_CAMARA) {
     pelotaCentrada = false;
@@ -819,15 +844,15 @@ void loop() {
   }
 
   // --- Ultrasonidos ---
-  int distFrontal = leerUltrasonidoAlto();
-  int distLateral = leerUltrasonidoLateral();
+  int distFrontal = usarUltrasonidoAhora ? leerUltrasonidoAlto()    : 999;
+  int distLateral = usarUltrasonidoAhora ? leerUltrasonidoLateral() : 999;
 
   int distParedEfectiva = 999;
   if (distFrontal < 999 && distLateral < 999) distParedEfectiva = min(distFrontal, distLateral);
   else if (distFrontal < 999)                 distParedEfectiva = distFrontal;
   else if (distLateral < 999)                 distParedEfectiva = distLateral;
 
-  // --- Infrarrojos (filtrados por distancia para ignorar puntos del piso) ---
+  // --- Infrarrojos (filtrados por tiempo continuo >= 25 ms y coincidencia de ambos frontales) ---
   bool lineaCruda = false, margenIzq = false, margenDer = false;
   if (LEER_IR) {
     lineaCruda = estaSobreLineaFrontal();
@@ -839,7 +864,39 @@ void loop() {
     lineaCruda = (trackCrudo == trackValorNegro);
   }
   bool lineaFrontal = filtrarNegro(filtroLinea, lineaCruda);
-  bool lineaArmada  = (millis() - tiempoArmadoLinea > VENTANA_IGNORAR_LINEA_MS);
+
+  // --- Gestión de salida del recuadro inicial (ignorar 1ra línea negra) ---
+  if (esEstadoDeNavegacion(estadoActual)) {
+    unsigned long tDesdeArmado = millis() - tiempoArmadoLinea;
+    // Alguno de los frontales filtrado (>= 25 ms) ve negro
+    bool algunFrontalFiltrado = (irFrontalIzq() == 1 || irFrontalDer() == 1);
+
+    if (etapaSalidaLinea == 0) {
+      if (lineaFrontal) {
+        etapaSalidaLinea = 1;
+        ultimoNegroSalida = millis();
+        Serial.println("-> [SALIDA] 1ra línea negra (recuadro inicial) detectada. Ignorando...");
+      } else if (tDesdeArmado > TIEMPO_ARMADO_RESPALDO_MS || estadoActual == ESQUIVAR_PISCINA) {
+        etapaSalidaLinea = 2;
+        limpiarHistorialLineaFrontal();
+        Serial.println("-> [SALIDA] Zona inicial superada. Detección de línea de cultivo ARMADA.");
+      }
+    } else if (etapaSalidaLinea == 1) {
+      if (algunFrontalFiltrado) {
+        ultimoNegroSalida = millis();
+      } else if ((millis() - ultimoNegroSalida > TIEMPO_BLANCO_TRAS_SALIDA_MS) &&
+                 (tDesdeArmado > VENTANA_IGNORAR_LINEA_MS)) {
+        etapaSalidaLinea = 2;
+        limpiarHistorialLineaFrontal();
+        filtroLinea.viendo = false;
+        filtroLinea.lecturas = 0;
+        lineaFrontal = false;
+        Serial.println("-> [SALIDA] 1ra línea negra superada. Detección de línea de cultivo ARMADA.");
+      }
+    }
+  }
+  bool lineaArmada = (etapaSalidaLinea >= 2) &&
+                     (millis() - tiempoArmadoLinea > VENTANA_IGNORAR_LINEA_MS);
 
   if (MODO == PRUEBA_SENSORES) {
     imprimirDiagnosticoSensores(distFrontal, distLateral);
@@ -867,11 +924,7 @@ void loop() {
 
     // ---------- NAVEGACIÓN (ida y vuelta) ----------
     case NAVEGAR: {
-      // Si un lateral pisa el margen, se aleja de él sin dejar de avanzar
-      int vxMargen = 0;
-      if (margenIzq && !margenDer) vxMargen =  V_REPELER_MARGEN;
-      if (margenDer && !margenIzq) vxMargen = -V_REPELER_MARGEN;
-      moverOmni(vxMargen, VELOCIDAD_BASE, wRumbo);
+      moverOmni(0, VELOCIDAD_BASE, wRumbo);
 
       if ((distFrontal >= 3 && distFrontal < UMBRAL_PISCINA_CM) ||
           (USAR_LATERAL_EN_DETECCION && distLateral >= 3 && distLateral < UMBRAL_PISCINA_CM)) {
@@ -902,7 +955,7 @@ void loop() {
       }
 
       // Robustez (no aplica en PRUEBA_ESQUIVA para conservar la prueba original)
-      if (MODO != PRUEBA_ESQUIVA) {
+      if (MODO != PRUEBA_ESQUIVA && lineaArmada) {
         bool margenAlFrente = (direccionEsquiva > 0) ? margenDer : margenIzq;
         bool sinSalida = (millis() - inicioEsquiva > TIMEOUT_ESQUIVA_MS);
         if (margenAlFrente || sinSalida) {
@@ -947,35 +1000,50 @@ void loop() {
     }
 
     // ---------- ESCUADRADO EN LA LÍNEA ----------
-    // Con los 2 IR frontales: gira hasta que ambos vean la línea.
-    // W > 0 gira a la izquierda (adelanta el lado derecho).
+    // Como estaSobreLineaFrontal() exige que AMBOS sensores frontales hayan tocado la línea,
+    // aquí sabemos exactamente cuántos ms tardó un sensor respecto al otro (desfaseFrontalesMs).
+    // Si llegaron casi al tiempo (<= 70 ms), ya está escuadrado y pasa directo al homing.
+    // Si llegó inclinado, hace un pulso de giro proporcional y acotado (máx 600 ms) sin quedarse girando.
     case ESCUADRAR: {
       if (!estadoIniciado) {
         estadoIniciado = true;
-        contadorEscuadre = 0;
+        long absDesfase = labs(desfaseFrontalesMs);
+        if (absDesfase <= 70) {
+          dirGiroEscuadre = 0;
+          duracionGiroEscuadreMs = 0;
+        } else {
+          // desfaseFrontalesMs > 0: izquierdo vio primero -> adelantar lado derecho (+SIGNO_ESCUADRE)
+          dirGiroEscuadre = (desfaseFrontalesMs > 0) ? SIGNO_ESCUADRE : -SIGNO_ESCUADRE;
+          duracionGiroEscuadreMs = constrain((unsigned long)(absDesfase * 1.3f), 120UL, MAX_GIRO_ESCUADRE_MS);
+        }
+        Serial.printf("   [ESCUADRAR] desfase=%ld ms -> giro correctivo=%lu ms (dir=%d)\n",
+                      desfaseFrontalesMs, duracionGiroEscuadreMs, dirGiroEscuadre);
       }
-      int izq = irFrontalIzq();
-      int der = irFrontalDer();
 
-      if (izq && der) {
-        contadorEscuadre++;
+      unsigned long tEnEstado = millis() - tiempoInicioEstado;
+
+      // 1. Pausa breve para asentar la inercia del frenado
+      if (tEnEstado < PAUSA_FRENO_LINEA_MS) {
         pararMotores();
-      } else {
-        contadorEscuadre = 0;
-        if (izq && !der)       moverOmni(0, 0,  SIGNO_ESCUADRE * W_ESCUADRE); // Adelanta el lado derecho
-        else if (!izq && der)  moverOmni(0, 0, -SIGNO_ESCUADRE * W_ESCUADRE); // Adelanta el lado izquierdo
-        else                   moverOmni(0, V_LENTO, 0);      // Ninguno: avanza despacio
+        break;
       }
 
-      bool listo = (contadorEscuadre >= LECTURAS_CONFIRMAR_ESCUADRE);
-      bool porTimeout = (millis() - tiempoInicioEstado > TIMEOUT_ESCUADRE_MS);
-      if (listo || porTimeout) {
-        fijarReferenciasAqui();  // La línea define "recto" y la distancia de trabajo
-        Serial.printf("-> Escuadrado %s. Rumbo de referencia = %+.1f°\n",
-                      listo ? "OK" : "por TIMEOUT", rumboGrados());
-        if (fase == FASE_IDA) cambiarEstado(HOMING_MARGEN, true);
-        else                  cambiarEstado(POSICIONAR_DESCARGA, true);
+      // 2. Pulso acotado de corrección angular (solo si entró inclinado y aún no están ambos en 1)
+      unsigned long tGiro = tEnEstado - PAUSA_FRENO_LINEA_MS;
+      bool ambosEnNegroAhora = (irFrontalIzq() == 1 && irFrontalDer() == 1);
+
+      if (tGiro < duracionGiroEscuadreMs && !ambosEnNegroAhora) {
+        moverOmni(0, 0, dirGiroEscuadre * W_ESCUADRE);
+        break;
       }
+
+      // 3. Listo: frena y pasa a HOMING_MARGEN
+      pararMotores();
+      delay(150);
+      fijarReferenciasAqui();
+      Serial.println("-> Escuadrado completado. Iniciando homing al margen izquierdo.");
+      if (fase == FASE_IDA) cambiarEstado(HOMING_MARGEN, true);
+      else                  cambiarEstado(POSICIONAR_DESCARGA, true);
       break;
     }
 
@@ -985,17 +1053,31 @@ void loop() {
         estadoIniciado = true;
         contadorMargen = 0;
       }
-      contadorMargen = margenIzq ? contadorMargen + 1 : 0;
+
+      unsigned long tEnHoming = millis() - tiempoInicioEstado;
+      bool vioMargen = false;
+      if (tEnHoming > VENTANA_INICIO_HOMING_MS) {
+        vioMargen = detectoMargenIzquierdo();
+      }
+
+      contadorMargen = vioMargen ? contadorMargen + 1 : 0;
       bool listo = (contadorMargen >= LECTURAS_CONFIRMAR_MARGEN);
-      bool porTimeout = (millis() - tiempoInicioEstado > TIMEOUT_HOMING_MS);
+      bool porTimeout = (tEnHoming > TIMEOUT_HOMING_MS);
 
       if (listo || porTimeout) {
+        pararMotores();
         refLateral = odoLateral;   // Origen lateral: margen izquierdo
         latMargenIzq = odoLateral;
         margenDerMedido = false;
         nivelBarrido = 1;
         direccionBarrido = 1;
-        Serial.printf("-> Homing %s. Origen lateral fijado.\n", listo ? "OK" : "por TIMEOUT");
+        Serial.printf("-> Homing %s. Encuadre finalizado en margen izquierdo.\n",
+                      listo ? "OK" : "por TIMEOUT");
+
+        if (!estadoPermitido(BARRIDO)) {
+          cambiarEstado(FIN_MISION, true);
+          break;
+        }
         moverElevadorANivel(1);
         iniciarNivelBarrido();
         cambiarEstado(BARRIDO, true);
@@ -1012,13 +1094,11 @@ void loop() {
         contadorMargen = 0;
       }
 
-      // Límite de tiempo de la ronda: cortar y regresar
       if (recoleccionSinTiempo()) {
         terminarRecoleccion("Tiempo límite de recolección");
         break;
       }
 
-      // Borde de un árbol: empieza la recolección de sus pelotas en este nivel
       bool arbolAhora = (distFrontal >= 3 && distFrontal < UMBRAL_ARBOL_CM);
       if (arbolAhora && !frenteAArbol) {
         frenteAArbol = true;
@@ -1051,7 +1131,7 @@ void loop() {
           direccionBarrido = -direccionBarrido;
           moverElevadorANivel(nivelBarrido);
           iniciarNivelBarrido();
-          estadoIniciado = false;          // Reinicia el nivel dentro del mismo estado
+          estadoIniciado = false;
           tiempoInicioEstado = millis();
         } else {
           Serial.println("-> Barrido completo. Centrando en la fila antes de regresar.");
@@ -1066,9 +1146,8 @@ void loop() {
     }
 
     // ---------- CENTRAR EN LA FILA ANTES DE REGRESAR ----------
-    // Evita regresar pegado a un margen (con un pequeño desvío lo pisaría).
     case CENTRAR_FILA: {
-      if (!margenDerMedido) {               // Sin dato del margen derecho: no centrar
+      if (!margenDerMedido) {
         iniciarGiro180(NAVEGAR);
         break;
       }
@@ -1081,15 +1160,12 @@ void loop() {
         break;
       }
       int vx = (faltaCm > 0) ? V_BARRIDO : -V_BARRIDO;
-      if (fabs(faltaCm) < 10.0f) vx /= 2;    // Más despacio al final
+      if (fabs(faltaCm) < 10.0f) vx /= 2;
       moverOmni(vx, correccionAvance(), wRumbo);
       break;
     }
 
     // ---------- RECOLECCIÓN: BORDE PRECISO DEL ÁRBOL ----------
-    // El ultrasonido se actualiza cada ~70 ms: a velocidad de barrido el borde
-    // se detecta tarde. Se retrocede despacio hasta perder el árbol y se vuelve
-    // hasta verlo otra vez; el promedio de ambos puntos cancela ese retraso.
     case ARBOL_REFINAR: {
       if (!estadoIniciado) {
         estadoIniciado = true;
@@ -1098,7 +1174,7 @@ void loop() {
       bool arbolVisto = (distFrontal >= 3 && distFrontal < UMBRAL_ARBOL_CM);
 
       if (millis() - tiempoInicioEstado > TIMEOUT_REFINO_MS) {
-        bordeArbolLat = odoLateral;            // Respaldo: usar la posición actual
+        bordeArbolLat = odoLateral;
         pelotaIdx = 0;
         Serial.println("   [ÁRBOL] Refinado por TIMEOUT: se usa la posición actual");
         cambiarEstado(PELOTA_IR, true);
@@ -1121,8 +1197,6 @@ void loop() {
     }
 
     // ---------- RECOLECCIÓN: PELOTA A PELOTA ----------
-    // Posición de la pelota i en el árbol: desde el borde detectado, centradas
-    // en ANCHO_ARBOL_CM y separadas ESPACIO_PELOTAS_CM, en el sentido del barrido.
     case PELOTA_IR: {
       if (recoleccionSinTiempo()) {
         terminarRecoleccion("Tiempo límite de recolección");
@@ -1157,7 +1231,7 @@ void loop() {
         }
       }
 
-      int decision = -1;   // -1 = aún esperando
+      int decision = -1;
       switch (MODO_DECISION) {
         case DECISION_TODAS:
           decision = 1;
@@ -1170,7 +1244,6 @@ void loop() {
           }
           break;
         case DECISION_CAMARA:
-          // Provisional: se ajusta cuando se defina el protocolo de la cámara
           if (pelotaCentrada) decision = 1;
           else if (millis() - tiempoInicioEstado > TIEMPO_ESPERA_CAMARA_MS) decision = 0;
           break;
@@ -1212,12 +1285,11 @@ void loop() {
       break;
 
     case PELOTA_RETIRAR: {
-      // Vuelve hasta la distancia de trabajo fijada en la línea (avanceObjetivo)
-      float faltaCm = pulsosACm(avanceObjetivo - odoAvance);   // negativo = falta retroceder
+      float faltaCm = pulsosACm(avanceObjetivo - odoAvance);
       if (faltaCm >= -0.5f || millis() - tiempoInicioEstado > TIMEOUT_RETIRAR_MS) {
         pararMotores();
         if (nivelBarrido == 3 && USAR_ELEVADOR) {
-          elevadorIrAMM(alturaNivelMM(3));   // Nivel 3: vuelve a subir tras soltar la pelota
+          elevadorIrAMM(alturaNivelMM(3));
         }
         if (MODO == PRUEBA_CAPTURA) {
           Serial.println("-> Captura terminada. Envía 'r' para repetir.");
@@ -1233,7 +1305,7 @@ void loop() {
 
     // ---------- GIRO 180° CONTROLADO ----------
     case GIRO_180: {
-      if (millis() - tiempoInicioEstado < PAUSA_ANTES_GIRO_MS) break; // Deja frenar
+      if (millis() - tiempoInicioEstado < PAUSA_ANTES_GIRO_MS) break;
 
       if (!estadoIniciado) {
         estadoIniciado = true;
@@ -1248,19 +1320,17 @@ void loop() {
 
       if (faltaGrados <= TOLERANCIA_GIRO_GRADOS || porTimeout) {
         pararMotores();
-        rumboObjetivo  = objetivo;   // El nuevo "recto" es exactamente 180° más
+        rumboObjetivo  = objetivo;
         avanceObjetivo = odoAvance;
         Serial.printf("-> Giro terminado: %.0f pulsos en %lu ms%s\n",
                       odoRumbo - rumboInicioGiro, millis() - inicioGiro,
                       porTimeout ? "  (TIMEOUT: revisar encoders)" : "");
-        tiempoArmadoLinea = millis();
-        filtroLinea.viendo = false;
+        rearmarSalidaLinea(false);
         if (MODO == PRUEBA_GIRO) finGiroCalibracion = millis();
         cambiarEstado(estadoTrasGiro, true);
         break;
       }
 
-      // Velocidad proporcional: frena al acercarse al objetivo
       int w = (int)(faltaGrados * 3.0f);
       w = constrain(w, VELOCIDAD_GIRO_MIN, VELOCIDAD_GIRO_MAX);
       moverOmni(0, 0, w);
